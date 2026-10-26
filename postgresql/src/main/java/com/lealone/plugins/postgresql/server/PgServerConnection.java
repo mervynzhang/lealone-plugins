@@ -102,6 +102,10 @@ public class PgServerConnection extends AsyncServerConnection {
 
     @Override
     public void close() {
+        // 关闭时排队中的包不可能再被处理，必须清掉(否则 payload 一直占着内存)
+        pendingPackets.clear();
+        busy = false;
+        awaitingAsync = false;
         if (session == null)
             return;
         try {
@@ -125,6 +129,8 @@ public class PgServerConnection extends AsyncServerConnection {
     }
 
     private int x;
+    /** 当前包 payload 的真实长度(getPacketLength 里记下来，拷贝时不能越过它) */
+    private int packetLength;
 
     @Override
     public int getPacketLength(ByteBuffer buffer) {
@@ -132,7 +138,8 @@ public class PgServerConnection extends AsyncServerConnection {
             x = (buffer.get() & 0xff);
         }
         int len = buffer.getInt();
-        return len - 4;
+        packetLength = len - 4;
+        return packetLength;
     }
 
     // 一条消息处理完(含异步执行完)才处理下一条：Execute/Query 是异步的，执行期间收到的
@@ -152,7 +159,7 @@ public class PgServerConnection extends AsyncServerConnection {
     private boolean draining;
     /** 已经往调度器里提交了一个 drain 任务 */
     private boolean drainScheduled;
-    private final java.util.ArrayDeque<Object[]> pendingPackets = new java.util.ArrayDeque<>();
+    private final PendingPackets pendingPackets = new PendingPackets();
 
     @Override
     public void handle(NetBuffer buffer, boolean autoRecycle) {
@@ -164,14 +171,18 @@ public class PgServerConnection extends AsyncServerConnection {
                 packetHandler.handle(buffer, 0);
                 return;
             }
-            if (x < 0) {
+            if (x < 0 || packetLength < 0) {
                 close();
                 return;
             }
             int type = x;
             byte[] data = copyPacket(buffer);
             if (busy) {
-                pendingPackets.add(new Object[] { type, data });
+                if (!pendingPackets.offer(type, data)) {
+                    // 队列有上限: 超限时回协议错误并断开，不能静默丢包(客户端/服务端会互相等)
+                    sendProtocolErrorAndClose("too many pending packets, pending="
+                            + pendingPackets.size() + ", bytes=" + pendingPackets.getBytes());
+                }
                 return;
             }
             busy = true;
@@ -183,6 +194,25 @@ public class PgServerConnection extends AsyncServerConnection {
         } finally {
             if (autoRecycle)
                 buffer.recycle();
+        }
+    }
+
+    /** 回一个 08P01 协议错误, 把响应刷到 socket 后再断开连接 */
+    public void sendProtocolErrorAndClose(String message) {
+        packetHandler.sendProtocolError(message);
+        flushPendingWrites();
+        close();
+    }
+
+    /** 把 output buffer 里攒着的响应同步写到 socket; 关闭连接前必须调用，否则最后的错误包会丢 */
+    private void flushPendingWrites() {
+        try {
+            com.lealone.net.NetEventLoop eventLoop = getWritableChannel().getEventLoop();
+            if (eventLoop != null) {
+                eventLoop.write();
+            }
+        } catch (Throwable t) {
+            server.traceError(DbException.convert(t));
         }
     }
 
@@ -244,12 +274,18 @@ public class PgServerConnection extends AsyncServerConnection {
 
     /**
      * 把当前包的有效载荷复制出来。注意 NetBuffer.length() 返回的是 dataBuffer.position()，
-     * 也就是"已经读到的位置"，不是包的结束位置；包尾要用底层 ByteBuffer 的 limit。
+     * 也就是"已经读到的位置"，不是包的结束位置。
+     * <p>
+     * 包尾必须用 getPacketLength() 记下的真实 payload 长度：底层 buffer 里可能还有同一次
+     * read() 读进来的后续包，用 bb.limit() 会把后面的包一起拷进来(排队时每条小包都拷贝
+     * 整个读缓冲区，内存被放大几十倍)。
      */
-    private static byte[] copyPacket(NetBuffer buffer) {
+    private byte[] copyPacket(NetBuffer buffer) {
         int start = buffer.position();
         java.nio.ByteBuffer bb = buffer.getByteBuffer();
-        int end = bb.limit();
+        int end = start + packetLength;
+        if (end > bb.limit())
+            end = bb.limit();
         int len = end - start;
         if (len <= 0)
             return new byte[0];

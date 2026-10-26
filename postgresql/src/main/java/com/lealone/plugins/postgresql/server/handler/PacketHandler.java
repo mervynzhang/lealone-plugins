@@ -116,6 +116,15 @@ public abstract class PacketHandler {
         sendMessage();
     }
 
+    /** 协议违规时给客户端回 08P01(调用方随后必须断开连接) */
+    public void sendProtocolError(String message) {
+        try {
+            sendErrorResponse(message);
+        } catch (Throwable t) {
+            logger.error("Failed to send protocol error: " + message, t);
+        }
+    }
+
     protected void sendErrorResponse(Throwable re) {
         SQLException e = DbException.toSQLException(re);
         server.traceError(e);
