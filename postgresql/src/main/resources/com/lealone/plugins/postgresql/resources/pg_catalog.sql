@@ -43,7 +43,11 @@ select
     cast(lower(schema_name) as varchar_ignorecase) nspname,
     (select min(id) from information_schema.users where admin=true) nspowner,
     cast(null as array) nspacl
-from information_schema.schemas;
+from information_schema.schemas
+-- performance_schema 是 Lealone 自己的内部 schema, PG 没有它; pgjdbc 的 getSchemas()
+-- 和 psql \dn 用 pg_namespace 跟 PG 对比时它会多出一行。information_schema.schemas
+-- 里仍然保留(核心视图不动), 这里只在 PG 兼容视图里过滤掉。
+where lower(schema_name) <> 'performance_schema';
 grant select on pg_catalog.pg_namespace to public;
 
 create table pg_catalog.pg_type(

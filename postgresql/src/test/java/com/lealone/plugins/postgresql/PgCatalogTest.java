@@ -144,6 +144,54 @@ public class PgCatalogTest extends PgTestBase {
         }
     }
 
+    @Test
+    public void getSchemasReflectsCreatedSchema() throws Exception {
+        // 兼容性矩阵里 getSchemas 对比失败(Lealone 少 m_s1)其实是用例顺序问题:
+        // meta.get_schemas 用例本身不建 m_s1, 真 PG 的库是常驻的, m_s1 是上一轮
+        // misc.schema_ddl 留下的; Lealone 每轮重启会清库。这里把"建完 schema 就能看到"
+        // 固化下来, 同时验证 information_schema.schemas 和插件 pg_namespace 两条路径。
+        try (Statement st = conn.createStatement()) {
+            st.executeUpdate("DROP SCHEMA IF EXISTS m_s1");
+        }
+        try (Statement st = conn.createStatement()) {
+            st.executeUpdate("CREATE SCHEMA m_s1");
+        }
+        try {
+            boolean found = false;
+            boolean performanceSchema = false;
+            try (ResultSet rs = conn.getMetaData().getSchemas()) {
+                while (rs.next()) {
+                    String schema = rs.getString("TABLE_SCHEM");
+                    if ("m_s1".equalsIgnoreCase(schema))
+                        found = true;
+                    if ("performance_schema".equalsIgnoreCase(schema))
+                        performanceSchema = true;
+                }
+            }
+            if (!found)
+                throw new AssertionError("getSchemas() 里没有刚建的 m_s1");
+            // performance_schema 是 Lealone 内部 schema, 真 PG 没有, pg_namespace 要过滤掉
+            if (performanceSchema)
+                throw new AssertionError("getSchemas() 不应该返回 Lealone 内部的 performance_schema");
+            try (Statement st = conn.createStatement();
+                    ResultSet rs = st.executeQuery("SELECT schema_name FROM information_schema.schemas"
+                            + " WHERE schema_name = 'M_S1'")) {
+                if (!rs.next())
+                    throw new AssertionError("information_schema.schemas 里没有 M_S1");
+            }
+            try (Statement st = conn.createStatement();
+                    ResultSet rs = st.executeQuery("SELECT nspname FROM pg_catalog.pg_namespace"
+                            + " WHERE nspname = 'm_s1'")) {
+                if (!rs.next())
+                    throw new AssertionError("pg_catalog.pg_namespace 里没有 m_s1");
+            }
+        } finally {
+            try (Statement st = conn.createStatement()) {
+                st.executeUpdate("DROP SCHEMA IF EXISTS m_s1");
+            }
+        }
+    }
+
     // 已知限制: pgjdbc 的 getColumns 用了 ROW_NUMBER() OVER (PARTITION BY ...) 窗口函数,
     // Lealone 尚未支持窗口函数; 等窗口函数支持后去掉 @Ignore
     @org.junit.Ignore("Lealone 不支持窗口函数, pgjdbc getColumns 需要")
