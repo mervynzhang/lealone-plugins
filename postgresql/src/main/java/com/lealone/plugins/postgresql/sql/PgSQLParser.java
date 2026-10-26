@@ -43,7 +43,7 @@ public class PgSQLParser extends SQLParserBase {
             .compile("(?i)'[^']*'\\s*::\\s*(?:pg_catalog\\.)?regclass");
 
     private static final Pattern REGTYPE_COL = Pattern
-            .compile("(?i)\\s*::\\s*(?:pg_catalog\\.)?(?:regtype|regclass)");
+            .compile("(?i)\\s*::\\s*(?:pg_catalog\\.)?(?:regtype|regclass|regproc|regprocedure|regoperator|regnamespace)");
     private static final Pattern TEXT_CAST = Pattern
             .compile("(?i)\\s*::\\s*(?:pg_catalog\\.)?(?:text|bpchar|name|char|varchar|int2|int4|int8|oid|bool)");
     private static final Pattern PG_REGEX_NOT_MATCH = Pattern

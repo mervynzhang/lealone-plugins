@@ -65,13 +65,17 @@ create table pg_catalog.pg_type(
     typtypmod int,
     typndims int,
     typnotnull boolean,
+    typinput varchar_ignorecase,
+    typoutput varchar_ignorecase,
+    typreceive varchar_ignorecase,
+    typsend varchar_ignorecase,
     typdefault varchar_ignorecase,
     typcollation int,
     typacl array);
 grant select on pg_catalog.pg_type to public;
 
 insert into pg_catalog.pg_type
-(oid, typname, typnamespace, typowner, typlen, typbyval, typtype, typcategory, typispreferred, typisdefined, typdelim, typrelid, typelem, typarray, typbasetype, typtypmod, typndims, typnotnull, typdefault, typcollation, typacl)
+(oid, typname, typnamespace, typowner, typlen, typbyval, typtype, typcategory, typispreferred, typisdefined, typdelim, typrelid, typelem, typarray, typbasetype, typtypmod, typndims, typnotnull, typinput, typoutput, typreceive, typsend, typdefault, typcollation, typacl)
 select
     pg_convertType(data_type) oid,
     cast(lower(type_name) as varchar_ignorecase) typname,
@@ -91,6 +95,10 @@ select
     -1 typtypmod,
     0 typndims,
     false typnotnull,
+    '' typinput,
+    '' typoutput,
+    '' typreceive,
+    '' typsend,
     cast(null as varchar) typdefault,
     0 typcollation,
     cast(null as array) typacl
