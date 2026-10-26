@@ -179,6 +179,39 @@ public class PgAlias {
             return "text[]";
         case 114:
             return "json";
+        // 兼容以 java.sql.Types 常量传进来的调用方(如 PgSyntaxTest)
+        case java.sql.Types.INTEGER:
+            return "integer";
+        case java.sql.Types.SMALLINT:
+            return "smallint";
+        case java.sql.Types.BIGINT:
+            return "bigint";
+        case java.sql.Types.REAL:
+            return "real";
+        case java.sql.Types.FLOAT:
+        case java.sql.Types.DOUBLE:
+            return "double precision";
+        case java.sql.Types.NUMERIC:
+        case java.sql.Types.DECIMAL:
+            return "numeric";
+        case java.sql.Types.CHAR:
+            return "character";
+        case java.sql.Types.VARCHAR:
+        case java.sql.Types.LONGVARCHAR:
+            return typmod > 4 ? "character varying(" + (typmod - 4) + ")" : "character varying";
+        case java.sql.Types.DATE:
+            return "date";
+        case java.sql.Types.TIME:
+            return "time without time zone";
+        case java.sql.Types.TIMESTAMP:
+            return "timestamp without time zone";
+        case java.sql.Types.BINARY:
+        case java.sql.Types.VARBINARY:
+            return "bytea";
+        case java.sql.Types.CLOB:
+            return "text";
+        case java.sql.Types.ARRAY:
+            return "text[]";
         default:
             return "unknown";
         }
