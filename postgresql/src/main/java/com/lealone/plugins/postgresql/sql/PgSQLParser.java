@@ -6,6 +6,8 @@
 package com.lealone.plugins.postgresql.sql;
 
 import java.util.ArrayList;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import com.lealone.common.util.Utils;
 import com.lealone.db.session.ServerSession;
@@ -23,6 +25,76 @@ public class PgSQLParser extends SQLParserBase {
     public PgSQLParser(ServerSession session) {
         super(session);
         this.session.setSchemaSearchPath(new String[] { "public", "pg_catalog" });
+    }
+
+    // psql 和 pgjdbc 会生成 PG 特有的操作符写法，解析前统一改写成 Lealone 支持的写法：
+    //   a OPERATOR(pg_catalog.~) 're'   -> a REGEXP 're'
+    //   a OPERATOR(pg_catalog.!~) 're'  -> NOT (a REGEXP 're')
+    //   a ~ 're'                        -> a REGEXP 're'
+    //   a !~ 're'                       -> NOT (a REGEXP 're')
+    private static final Pattern PG_OPERATOR = Pattern
+            .compile("(?i)OPERATOR\\s*\\(\\s*(?:pg_catalog\\.)?(~\\*?|!~\\*?|=|<>|<|>|<=|>=)\\s*\\)");
+    private static final Pattern PG_REGEX_MATCH = Pattern
+            .compile("([A-Za-z_][A-Za-z0-9_$.]*)\\s+~\\s+('[^']*')");
+    private static final Pattern REGTYPE_CAST = Pattern
+            .compile("(?i)'[^']*'\\s*::\\s*(?:pg_catalog\\.)?regtype");
+    private static final Pattern REGCLASS_CAST = Pattern
+            .compile("(?i)'[^']*'\\s*::\\s*(?:pg_catalog\\.)?regclass");
+
+    private static final Pattern REGTYPE_COL = Pattern
+            .compile("(?i)\\s*::\\s*(?:pg_catalog\\.)?(?:regtype|regclass)");
+    private static final Pattern TEXT_CAST = Pattern
+            .compile("(?i)\\s*::\\s*(?:pg_catalog\\.)?(?:text|bpchar|name|char|varchar|int2|int4|int8|oid|bool)");
+    private static final Pattern PG_REGEX_NOT_MATCH = Pattern
+            .compile("([A-Za-z_][A-Za-z0-9_$.]*)\\s+!~\\s+('[^']*')");
+
+    static String normalize(String sql) {
+        if (sql == null || sql.indexOf('~') < 0 && sql.indexOf("::") < 0
+                && sql.toUpperCase().indexOf("OPERATOR") < 0 && sql.indexOf("E'") < 0)
+            return sql;
+        String s = sql;
+        Matcher m = PG_OPERATOR.matcher(s);
+        StringBuffer sb = new StringBuffer();
+        while (m.find()) {
+            String op = m.group(1);
+            String rep;
+            switch (op) {
+            case "~":
+            case "~*":
+                rep = "REGEXP";
+                break;
+            case "!~":
+            case "!~*":
+                rep = "NOTREGEXP";
+                break;
+            default:
+                rep = op;
+                break;
+            }
+            m.appendReplacement(sb, Matcher.quoteReplacement(rep));
+        }
+        m.appendTail(sb);
+        s = sb.toString();
+        if (s.contains("NOTREGEXP")) {
+            // a NOTREGEXP 're' -> NOT (a REGEXP 're')
+            s = s.replaceAll("([A-Za-z_][A-Za-z0-9_$.]*)\\s+NOTREGEXP\\s+('[^']*')", "NOT ($1 REGEXP $2)");
+        }
+        s = PG_REGEX_NOT_MATCH.matcher(s).replaceAll("NOT ($1 REGEXP $2)");
+        s = PG_REGEX_MATCH.matcher(s).replaceAll("$1 REGEXP $2");
+        // 'pg_catalog.trigger'::pg_catalog.regtype 这类强转, Lealone 没有 regtype/regclass 类型,
+        // 直接换成 0(只会参与类型比较, 空的 pg_proc 里不会命中)
+        s = REGTYPE_CAST.matcher(s).replaceAll("0");
+        s = REGCLASS_CAST.matcher(s).replaceAll("0");
+        // 剩下的列级强转 Lealone 没有对应类型, 直接去掉(值本来就是字符串/整数)
+        s = REGTYPE_COL.matcher(s).replaceAll("");
+        s = TEXT_CAST.matcher(s).replaceAll("");
+        s = normalizeEStrings(s);
+        return s;
+    }
+
+    @Override
+    public StatementBase parse(String sql) {
+        return super.parse(normalize(sql));
     }
 
     @Override
@@ -276,5 +348,64 @@ public class PgSQLParser extends SQLParserBase {
     protected Expression parseVariable() {
         read();
         return new PgVariable(session, readAliasIdentifier());
+    }
+
+    /** E'\n' 这种 escape string 转成普通字符串字面量(处理 \\n \\t \\r \\\\ \\' 这几个常见转义) */
+    static String normalizeEStrings(String sql) {
+        if (sql.indexOf("E'") < 0 && sql.indexOf("e'") < 0)
+            return sql;
+        StringBuilder sb = new StringBuilder(sql.length());
+        int i = 0;
+        int len = sql.length();
+        boolean inString = false;
+        while (i < len) {
+            char ch = sql.charAt(i);
+            if (!inString && (ch == 'E' || ch == 'e') && i + 1 < len && sql.charAt(i + 1) == '\'') {
+                // 跳过 E 前缀, 把内容按转义规则解出来
+                i += 2;
+                sb.append('\'');
+                while (i < len) {
+                    char c = sql.charAt(i);
+                    if (c == '\\' && i + 1 < len) {
+                        char n = sql.charAt(i + 1);
+                        switch (n) {
+                        case 'n':
+                            sb.append('\n');
+                            break;
+                        case 't':
+                            sb.append('\t');
+                            break;
+                        case 'r':
+                            sb.append('\r');
+                            break;
+                        case '\\':
+                            sb.append('\\');
+                            break;
+                        case '\'':
+                            sb.append('\'');
+                            break;
+                        default:
+                            sb.append(n);
+                            break;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if (c == '\'') {
+                        sb.append(c);
+                        i++;
+                        break;
+                    }
+                    sb.append(c);
+                    i++;
+                }
+                continue;
+            }
+            if (ch == '\'')
+                inString = !inString;
+            sb.append(ch);
+            i++;
+        }
+        return sb.toString();
     }
 }

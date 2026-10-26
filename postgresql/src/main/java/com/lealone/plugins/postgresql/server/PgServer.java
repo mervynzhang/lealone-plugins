@@ -34,7 +34,7 @@ public class PgServer extends AsyncServer<PgServerConnection> {
 
     private static final Logger logger = LoggerFactory.getLogger(PgServer.class);
 
-    public static final String PG_VERSION = "8.2.23";
+    public static final String PG_VERSION = "9.4.26";
     public static final String PG_CATALOG_FILE = "/com/lealone/plugins/postgresql/resources/pg_catalog.sql";
     public static final int DEFAULT_PORT = 5432;
 
@@ -144,6 +144,30 @@ public class PgServer extends AsyncServer<PgServerConnection> {
             }
             r.close();
         }
+        // 缓存用户 id -> name, 供 pg_get_userbyid 使用(别名函数里不能再查库)
+        java.util.HashMap<Integer, String> users = new java.util.HashMap<>();
+        Result ur = session.executeQueryLocal("SELECT ID, NAME FROM INFORMATION_SCHEMA.USERS");
+        while (ur.next()) {
+            users.put(ur.currentRow()[0].getInt(), ur.currentRow()[1].getString());
+        }
+        ur.close();
+        com.lealone.plugins.postgresql.sql.PgAlias.setUserNames(users);
+        // 索引元数据快照(psql \d 会按索引 id 取索引定义/列名)
+        java.util.HashMap<Integer, String> idxSql = new java.util.HashMap<>();
+        java.util.HashMap<String, String> idxColumns = new java.util.HashMap<>();
+        Result ir = session.executeQueryLocal(
+                "SELECT ID, ORDINAL_POSITION, COLUMN_NAME, SQL FROM INFORMATION_SCHEMA.INDEXES");
+        while (ir.next()) {
+            int id = ir.currentRow()[0].getInt();
+            int pos = ir.currentRow()[1].getInt();
+            String column = ir.currentRow()[2].getString();
+            String sql = ir.currentRow()[3].getString();
+            idxColumns.put(id + ":" + pos, column);
+            if (sql != null)
+                idxSql.put(id, sql);
+        }
+        ir.close();
+        com.lealone.plugins.postgresql.sql.PgAlias.setIndexCache(idxSql, idxColumns);
     }
 
     public static void installPgCatalog(ServerSession session, boolean trace) throws SQLException {

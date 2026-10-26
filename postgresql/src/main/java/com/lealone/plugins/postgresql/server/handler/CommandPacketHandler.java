@@ -210,13 +210,15 @@ public class CommandPacketHandler extends PacketHandler {
             }
             sendParameterDescription(p);
             sendRowDescriptionOrNoData(p.prep);
+            p.columnTypes = resultColumnTypes;
         } else if (type == 'P') {
             Portal p = portals.get(name);
             if (p == null) {
                 sendErrorResponse("Portal not found: " + name);
                 return;
             }
-            sendRowDescriptionOrNoData(p.prep.prep);
+            sendRowDescriptionOrNoData(p.prep.prep, p.resultColumnFormat);
+            p.formats = resultFormats;
         } else {
             sendErrorResponse("expected S or P, got " + type);
         }
@@ -232,6 +234,8 @@ public class CommandPacketHandler extends PacketHandler {
             return false;
         }
         Prepared prep = p.prep;
+        resultColumnTypes = prep.columnTypes;
+        resultFormats = formatsFor(prep.columnTypes, p.resultColumnFormat);
         applyParameters(prep, p.values);
         if (prep.prep.isQuery()) {
             PreparedSQLStatement.Yieldable<?> yieldable = prep.prep.createYieldableQuery(maxRows,
@@ -242,6 +246,7 @@ public class CommandPacketHandler extends PacketHandler {
                             } else {
                                 Result result = ar.getResult();
                                 try {
+                                    applyResultFormats(result, p.resultColumnFormat);
                                     int rowCount = 0;
                                     while (result.next()) {
                                         sendDataRow(result);
@@ -319,6 +324,9 @@ public class CommandPacketHandler extends PacketHandler {
     }
 
     private QueryQueue queryQueue;
+
+    /** 当前结果集每列的输出格式: 0=text, 1=binary(客户端在 Bind 里要求的) */
+    private int[] resultFormats;
 
     /** 当前结果集每列的 PG 类型，DataRow 输出时要按类型做文本编码(bool 用 t/f，bytea 用 \\x 十六进制) */
     private int[] resultColumnTypes;
@@ -644,7 +652,18 @@ public class CommandPacketHandler extends PacketHandler {
         writeShort(columns);
         Value[] row = rs.currentRow();
         for (int i = 0; i < columns; i++) {
-            String s = toText(row[i], i);
+            Value v = row[i];
+            if (resultFormats != null && i < resultFormats.length && resultFormats[i] == 1) {
+                byte[] bin = toBinary(v, i);
+                if (bin == null)
+                    writeInt(-1);
+                else {
+                    writeInt(bin.length);
+                    write(bin);
+                }
+                continue;
+            }
+            String s = toText(v, i);
             if (s == null) {
                 writeInt(-1);
             } else {
@@ -654,6 +673,105 @@ public class CommandPacketHandler extends PacketHandler {
             }
         }
         sendMessage();
+    }
+
+    /** Execute 时按真实结果集的列类型决定每列输出格式(客户端在 Bind 里请求 binary 时要照着编) */
+    private void applyResultFormats(Result result, int[] requestedFormats) {
+        int columns = result.getVisibleColumnCount();
+        int[] types = new int[columns];
+        for (int i = 0; i < columns; i++) {
+            types[i] = PgType.convertValueType(result.getColumnType(i));
+        }
+        resultColumnTypes = types;
+        resultFormats = formatsFor(types, requestedFormats);
+    }
+
+    private static int[] formatsFor(int[] columnTypes, int[] requestedFormats) {
+        if (columnTypes == null || requestedFormats == null || requestedFormats.length == 0)
+            return null;
+        int[] formats = new int[columnTypes.length];
+        for (int i = 0; i < columnTypes.length; i++) {
+            formats[i] = wantsBinary(requestedFormats, i) && canEncodeBinary(columnTypes[i]) ? 1 : 0;
+        }
+        return formats;
+    }
+
+    /** 客户端在 Bind 里给的 result format codes(规则同 PG: 0 个=全 text, 1 个=套用到所有列) */
+    private static boolean wantsBinary(int[] formats, int column) {
+        if (formats == null || formats.length == 0)
+            return false;
+        if (formats.length == 1)
+            return formats[0] == 1;
+        return column < formats.length && formats[column] == 1;
+    }
+
+    /** 我们能输出二进制格式的类型(其余列退化成 text, 客户端按 RowDescription 里的格式码解析) */
+    private static boolean canEncodeBinary(int pgType) {
+        switch (pgType) {
+        case PgType.PG_TYPE_BOOL:
+        case PgType.PG_TYPE_INT2:
+        case PgType.PG_TYPE_INT4:
+        case PgType.PG_TYPE_INT8:
+        case PgType.PG_TYPE_FLOAT4:
+        case PgType.PG_TYPE_FLOAT8:
+        case PgType.PG_TYPE_BYTEA:
+        case PgType.PG_TYPE_VARCHAR:
+        case PgType.PG_TYPE_TEXT:
+        case PgType.PG_TYPE_BPCHAR:
+        case PgType.PG_TYPE_DATE:
+        case PgType.PG_TYPE_TIMESTAMP_NO_TMZONE:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    /** 按列类型输出 PG 二进制格式(客户端在 Bind 里要求 binary 时) */
+    private byte[] toBinary(Value v, int column) throws java.io.UnsupportedEncodingException {
+        if (v == null || v == ValueNull.INSTANCE)
+            return null;
+        int type = resultColumnTypes != null && column < resultColumnTypes.length
+                ? resultColumnTypes[column]
+                : PgType.PG_TYPE_UNKNOWN;
+        switch (type) {
+        case PgType.PG_TYPE_BOOL:
+            return new byte[] { (byte) (v.getBoolean() ? 1 : 0) };
+        case PgType.PG_TYPE_INT2:
+            return java.nio.ByteBuffer.allocate(2).putShort((short) v.getInt()).array();
+        case PgType.PG_TYPE_INT4:
+            return java.nio.ByteBuffer.allocate(4).putInt(v.getInt()).array();
+        case PgType.PG_TYPE_INT8:
+            return java.nio.ByteBuffer.allocate(8).putLong(v.getLong()).array();
+        case PgType.PG_TYPE_FLOAT4:
+            return java.nio.ByteBuffer.allocate(4).putFloat((float) v.getDouble()).array();
+        case PgType.PG_TYPE_FLOAT8:
+            return java.nio.ByteBuffer.allocate(8).putDouble(v.getDouble()).array();
+        case PgType.PG_TYPE_BYTEA:
+            return v.getBytesNoCopy();
+        case PgType.PG_TYPE_VARCHAR:
+        case PgType.PG_TYPE_TEXT:
+        case PgType.PG_TYPE_BPCHAR:
+            return v.getString().getBytes(getEncoding());
+        case PgType.PG_TYPE_DATE: {
+            // PG: 从 2000-01-01 起的天数
+            java.time.LocalDate d = java.time.LocalDate.parse(v.getString().substring(0, 10));
+            long days = d.toEpochDay() - java.time.LocalDate.of(2000, 1, 1).toEpochDay();
+            return java.nio.ByteBuffer.allocate(4).putInt((int) days).array();
+        }
+        case PgType.PG_TYPE_TIMESTAMP_NO_TMZONE: {
+            // PG: 从 2000-01-01 00:00:00 起的微秒数
+            String s = v.getString();
+            if (s.length() > 19)
+                s = s.substring(0, 19);
+            java.time.LocalDateTime ts = java.time.LocalDateTime
+                    .parse(s.replace(' ', 'T'));
+            long micros = java.time.Duration
+                    .between(java.time.LocalDateTime.of(2000, 1, 1, 0, 0), ts).toNanos() / 1000;
+            return java.nio.ByteBuffer.allocate(8).putLong(micros).array();
+        }
+        default:
+            return v.getString().getBytes(getEncoding());
+        }
     }
 
     /** 按列类型做 PG 文本格式编码：boolean 必须是 t/f，bytea 必须是 \\x 十六进制 */
@@ -695,12 +813,17 @@ public class CommandPacketHandler extends PacketHandler {
     }
 
     private void sendRowDescriptionOrNoData(PreparedSQLStatement stmt) throws IOException {
+        sendRowDescriptionOrNoData(stmt, null);
+    }
+
+    private void sendRowDescriptionOrNoData(PreparedSQLStatement stmt, int[] requestedFormats)
+            throws IOException {
         if (!stmt.isQuery()) {
             sendNoData();
             return;
         }
         try {
-            sendRowDescription(stmt.getMetaData().get());
+            sendRowDescription(stmt.getMetaData().get(), requestedFormats);
         } catch (Exception e) {
             sendErrorResponse(e);
         }
@@ -717,6 +840,10 @@ public class CommandPacketHandler extends PacketHandler {
      * 要么真写二进制编码，要么老实声明 text；这里选后者。
      */
     private void sendRowDescription(Result result) throws IOException {
+        sendRowDescription(result, null);
+    }
+
+    private void sendRowDescription(Result result, int[] requestedFormats) throws IOException {
         if (result == null) {
             sendNoData();
             return;
@@ -749,6 +876,11 @@ public class CommandPacketHandler extends PacketHandler {
             types[i] = pgType;
         }
         resultColumnTypes = types;
+        int[] formats = new int[columns];
+        for (int i = 0; i < columns; i++) {
+            formats[i] = wantsBinary(requestedFormats, i) && canEncodeBinary(types[i]) ? 1 : 0;
+        }
+        resultFormats = formats;
         startMessage('T');
         writeShort(columns);
         for (int i = 0; i < columns; i++) {
@@ -758,7 +890,7 @@ public class CommandPacketHandler extends PacketHandler {
             writeInt(types[i]);
             writeShort(getTypeSize(types[i], precision[i]));
             writeInt(-1);
-            writeShort(0); // text 格式
+            writeShort(formats[i]);
         }
         sendMessage();
     }
@@ -788,6 +920,8 @@ public class CommandPacketHandler extends PacketHandler {
     }
 
     static class Prepared {
+        /** Describe('S') 时得到的列类型, Bind 请求二进制输出时用来编码 */
+        int[] columnTypes;
         String name;
         String sql;
         PreparedSQLStatement prep;
@@ -799,5 +933,7 @@ public class CommandPacketHandler extends PacketHandler {
         Prepared prep;
         Value[] values;
         int[] resultColumnFormat;
+        /** Describe 时算好的每列输出格式, Execute 时复用 */
+        int[] formats;
     }
 }

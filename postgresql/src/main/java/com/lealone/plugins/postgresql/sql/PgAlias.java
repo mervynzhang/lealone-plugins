@@ -42,35 +42,15 @@ public class PgAlias {
      * @return the SQL statement or the column name
      */
     public static String getIndexColumn(Connection conn, int indexId, Integer ordinalPosition,
-            Boolean pretty) throws SQLException {
+            Boolean pretty) {
         if (ordinalPosition == null || ordinalPosition.intValue() == 0) {
-            PreparedStatement prep = conn
-                    .prepareStatement("select sql from information_schema.indexes where id=?");
-            prep.setInt(1, indexId);
-            ResultSet rs = prep.executeQuery();
-            if (rs.next()) {
-                return rs.getString(1);
-            }
-            return "";
+            String sql = INDEX_SQL.get(indexId);
+            return sql == null ? "" : sql;
         }
-        PreparedStatement prep = conn.prepareStatement(
-                "select column_name from information_schema.indexes where id=? and ordinal_position=?");
-        prep.setInt(1, indexId);
-        prep.setInt(2, ordinalPosition.intValue());
-        ResultSet rs = prep.executeQuery();
-        if (rs.next()) {
-            return rs.getString(1);
-        }
-        return "";
+        String column = INDEX_COLUMNS.get(indexId + ":" + ordinalPosition.intValue());
+        return column == null ? "" : column;
     }
 
-    /**
-     * Get the name of the current schema.
-     * This method is called by the database.
-     *
-     * @param conn the connection
-     * @return the schema name
-     */
     public static String getCurrentSchema(Connection conn) throws SQLException {
         ResultSet rs = conn.createStatement().executeQuery("call schema()");
         rs.next();
@@ -142,42 +122,47 @@ public class PgAlias {
                 + Constants.getFullVersion() + ", 64-bit";
     }
 
+    /** format_type: psql 显示列类型用。注意 atttypid 存的是 PG 的 OID(不是 java.sql.Types) */
     public static String formatType(final int type, final int typmod) {
         switch (type) {
-        case Types.BOOLEAN:
-            return "PG_TYPE_BOOL";
-        case Types.VARCHAR:
-            return "PG_TYPE_VARCHAR";
-        case Types.CLOB:
-            return "PG_TYPE_TEXT";
-        case Types.CHAR:
-            return "PG_TYPE_BPCHAR";
-        case Types.SMALLINT:
-            return "PG_TYPE_INT2";
-        case Types.INTEGER:
-            return "PG_TYPE_INT4";
-        case Types.BIGINT:
-            return "PG_TYPE_INT8";
-        case Types.DECIMAL:
-            return "PG_TYPE_NUMERIC";
-        case Types.REAL:
-            return "PG_TYPE_FLOAT4";
-        case Types.DOUBLE:
-            return "PG_TYPE_FLOAT8";
-        case Types.TIME:
-            return "PG_TYPE_TIME";
-        case Types.DATE:
-            return "PG_TYPE_DATE";
-        case Types.TIMESTAMP:
-            return "PG_TYPE_TIMESTAMP_NO_TMZONE";
-        case Types.VARBINARY:
-            return "PG_TYPE_BYTEA";
-        case Types.BLOB:
-            return "PG_TYPE_OID";
-        case Types.ARRAY:
-            return "PG_TYPE_TEXTARRAY";
+        case 16:
+            return "boolean";
+        case 21:
+            return "smallint";
+        case 23:
+            return "integer";
+        case 20:
+            return "bigint";
+        case 700:
+            return "real";
+        case 701:
+            return "double precision";
+        case 1700:
+            return "numeric";
+        case 1043:
+            return typmod > 4 ? "character varying(" + (typmod - 4) + ")" : "character varying";
+        case 1042:
+            return typmod > 4 ? "character(" + (typmod - 4) + ")" : "character";
+        case 25:
+            return "text";
+        case 1082:
+            return "date";
+        case 1083:
+            return "time without time zone";
+        case 1114:
+            return "timestamp without time zone";
+        case 1184:
+            return "timestamp with time zone";
+        case 17:
+            return "bytea";
+        case 26:
+            return "oid";
+        case 1009:
+            return "text[]";
+        case 114:
+            return "json";
         default:
-            return "PG_TYPE_UNKNOWN";
+            return "unknown";
         }
     }
 
@@ -199,25 +184,27 @@ public class PgAlias {
      * @param id the user id
      * @return the user name
      */
-    public static String getUserById(Connection conn, int id) throws SQLException {
-        PreparedStatement prep = conn
-                .prepareStatement("SELECT NAME FROM INFORMATION_SCHEMA.USERS WHERE ID=?");
-        prep.setInt(1, id);
-        ResultSet rs = prep.executeQuery();
-        if (rs.next()) {
-            return rs.getString(1);
-        }
-        return null;
+    // 别名函数拿到的是同一 session 的嵌套连接，遍历外层结果集时再查库会把外层游标冲掉
+    // (外层会静默变成 0 行)，所以用户表和索引元数据在会话建立时快照到缓存里。
+    private static volatile java.util.Map<Integer, String> USER_NAMES = java.util.Collections.emptyMap();
+    private static volatile java.util.Map<Integer, String> INDEX_SQL = java.util.Collections.emptyMap();
+    private static volatile java.util.Map<String, String> INDEX_COLUMNS = java.util.Collections.emptyMap();
+
+    public static void setUserNames(java.util.Map<Integer, String> names) {
+        USER_NAMES = names;
     }
 
-    /**
-     * Check if the this session has the given database privilege.
-     * This method is called by the database.
-     *
-     * @param id the session id
-     * @param privilege the privilege to check
-     * @return true
-     */
+    public static void setIndexCache(java.util.Map<Integer, String> sql,
+            java.util.Map<String, String> columns) {
+        INDEX_SQL = sql;
+        INDEX_COLUMNS = columns;
+    }
+
+    public static String getUserById(Connection conn, int id) {
+        String name = USER_NAMES.get(id);
+        return name == null ? null : name.toLowerCase();
+    }
+
     public static boolean hasDatabasePrivilege(int id, String privilege) {
         return true;
     }
@@ -254,5 +241,166 @@ public class PgAlias {
      */
     public static int convertType(int type) {
         return PgType.convertType(type);
+    }
+
+    // ---------------------------------------------------------------- psql / pgjdbc 需要的 catalog 辅助函数
+
+    public static boolean pgTableIsVisible(Connection conn, int oid) {
+        return true;
+    }
+
+    public static boolean pgFunctionIsVisible(Connection conn, int oid) {
+        return true;
+    }
+
+    public static boolean pgTypeIsVisible(Connection conn, int oid) {
+        return true;
+    }
+
+    public static boolean pgCollationIsVisible(Connection conn, int oid) {
+        return true;
+    }
+
+    public static boolean hasSchemaPrivilege(Connection conn, String schema, String privilege) {
+        return true;
+    }
+
+    public static boolean hasColumnPrivilege(Connection conn, String table, String column,
+            String privilege) {
+        return true;
+    }
+
+    public static boolean hasFunctionPrivilege(Connection conn, String function, String privilege) {
+        return true;
+    }
+
+    public static String arrayToString(Object array, String separator) {
+        if (array == null)
+            return null;
+        String sep = separator == null ? "" : separator;
+        StringBuilder sb = new StringBuilder();
+        if (array instanceof Object[]) {
+            Object[] a = (Object[]) array;
+            for (int i = 0; i < a.length; i++) {
+                if (i > 0)
+                    sb.append(sep);
+                sb.append(a[i]);
+            }
+            return sb.toString();
+        }
+        return array.toString();
+    }
+
+    public static String getFunctionResult(Connection conn, int oid) {
+        return "";
+    }
+
+    public static String getFunctionArguments(Connection conn, int oid) {
+        return "";
+    }
+
+    public static String getFunctionIdentityArguments(Connection conn, int oid) {
+        return "";
+    }
+
+    public static String getFunctionDef(Connection conn, int oid) {
+        return "";
+    }
+
+    public static String getExpr(Connection conn, String expr, int relid) {
+        return expr == null ? "" : expr;
+    }
+
+    public static String getExpr(Connection conn, String expr, int relid, Boolean pretty) {
+        return expr == null ? "" : expr;
+    }
+
+    public static String getConstraintDef(Connection conn, int oid) {
+        return "";
+    }
+
+    public static String getConstraintDef(Connection conn, int oid, Boolean pretty) {
+        return "";
+    }
+
+    public static String getViewDef(Connection conn, int oid) {
+        return "";
+    }
+
+    public static String getTriggerDef(Connection conn, int oid) {
+        return "";
+    }
+
+    public static String getRuleDef(Connection conn, int oid) {
+        return "";
+    }
+
+    public static String getPartKeyDef(Connection conn, int oid) {
+        return null;
+    }
+
+    public static String getSerialSequence(Connection conn, String table, String column) {
+        return null;
+    }
+
+    public static String getCurrentDatabase(Connection conn) throws SQLException {
+        String catalog = conn.getCatalog();
+        return catalog == null ? "postgres" : catalog;
+    }
+
+    public static String getCurrentSetting(Connection conn, String name) {
+        if (name == null)
+            return null;
+        switch (name.toLowerCase()) {
+        case "server_version":
+            return PgServer.PG_VERSION;
+        case "server_encoding":
+        case "client_encoding":
+            return "UTF8";
+        case "transaction_isolation":
+        case "default_transaction_isolation":
+            return "read committed";
+        case "datestyle":
+            return "ISO, MDY";
+        case "search_path":
+            return "public, pg_catalog";
+        default:
+            return "";
+        }
+    }
+
+    public static int getBackendPid() {
+        return (int) ProcessHandle.current().pid();
+    }
+
+    public static String getSizePretty(long size) {
+        if (size < 0)
+            return null;
+        if (size < 10240)
+            return size + " bytes";
+        final String[] units = { "kB", "MB", "GB", "TB" };
+        double v = size / 1024.0;
+        int i = 0;
+        while (v >= 10240 && i < units.length - 1) {
+            v /= 1024.0;
+            i++;
+        }
+        return String.format(java.util.Locale.ROOT, "%.0f %s", v, units[i]);
+    }
+
+    public static String objDescription(Connection conn, int oid) {
+        return null;
+    }
+
+    public static String objDescription(Connection conn, int oid, String catalogName) {
+        return null;
+    }
+
+    public static String colDescription(Connection conn, int relid, int columnNumber) {
+        return null;
+    }
+
+    public static String shobjDescription(Connection conn, int oid, String catalogName) {
+        return null;
     }
 }
