@@ -6,6 +6,7 @@
 package com.lealone.plugins.postgresql;
 
 import java.math.BigDecimal;
+import java.sql.BatchUpdateException;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -59,6 +60,47 @@ public class PgExtendedProtocolTest extends PgTestBase {
             int count = rs.getInt(1);
             if (count != 1000)
                 throw new AssertionError("executeBatch 应该写入 1000 行, 实际 " + count);
+        }
+    }
+
+    /**
+     * 批处理中途某一条 Execute 失败(主键冲突)时，后面已经排队的 Bind/Execute 包必须继续被处理，
+     * 连接不能卡死：回调里 dispatch 新命令会撞上核心 endYieldableCommand 清空 yieldableCommand，
+     * 老实现从此不再调用 packetFinished，busy 永远为 true，客户端只能等到 socket 超时。
+     */
+    @Test(timeout = 90000)
+    public void executeBatchFailureKeepsConnectionUsable() throws Exception {
+        try (Statement st = conn.createStatement()) {
+            st.executeUpdate("DROP TABLE IF EXISTS ep_batch_err");
+            st.executeUpdate("CREATE TABLE ep_batch_err(id int primary key, v varchar(20))");
+            st.executeUpdate("INSERT INTO ep_batch_err VALUES(1,'seed')");
+        }
+        try (Connection c = getPgConnection(15);
+                PreparedStatement ps = c.prepareStatement("INSERT INTO ep_batch_err VALUES(?,?)")) {
+            for (int i = 1; i <= 50; i++) {
+                ps.setInt(1, i); // i=1 与 seed 冲突, 是批处理里的第 1 条
+                ps.setString(2, "v" + i);
+                ps.addBatch();
+            }
+            boolean failed = false;
+            try {
+                ps.executeBatch();
+            } catch (BatchUpdateException e) {
+                failed = true;
+                if (e.getSQLState() == null)
+                    throw new AssertionError("批处理失败必须带 SQLState(ErrorResponse)");
+            }
+            if (!failed)
+                throw new AssertionError("主键冲突的批处理应该抛 BatchUpdateException");
+            // 错误之后必须收到 ReadyForQuery 并且连接还能继续用; 老实现这里会 socket 超时
+            try (Statement st = c.createStatement();
+                    ResultSet rs = st.executeQuery("SELECT count(*) FROM ep_batch_err")) {
+                rs.next();
+                int count = rs.getInt(1);
+                // 后续的 Bind/Execute(2..50) 仍被处理, 而不是被静默丢弃
+                if (count != 50)
+                    throw new AssertionError("错误之后的批次没有被处理, 行数 " + count + ", 期望 50");
+            }
         }
     }
 

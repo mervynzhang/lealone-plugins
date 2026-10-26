@@ -136,8 +136,22 @@ public class PgServerConnection extends AsyncServerConnection {
     }
 
     // 一条消息处理完(含异步执行完)才处理下一条：Execute/Query 是异步的，执行期间收到的
-    // 后续包先复制排队，回调里调用 packetFinished() 再按顺序处理，保证协议顺序且不阻塞调度线程。
+    // 后续包先复制排队，完成后继续按顺序处理，保证协议顺序且不阻塞调度线程。
+    //
+    // 注意: 绝不能在异步回调的调用栈里直接 dispatch 下一条包。核心的 YieldableBase 是
+    // "先 asyncHandler.handle(...) 再 stop()"，而 stop() -> ServerSession.stopCurrentCommand()
+    // 最后会 endYieldableCommand() 把 yieldableCommand 清空；如果回调里递归 dispatch 并提交了
+    // 新的 YieldableCommand，就会被这次清空顺手抹掉，新语句永远不执行、packetFinished 也
+    // 不会再被调用，busy 永远为 true，客户端只能等到超时。
+    // 所以这里用 trampoline: 回调只登记"前一条命令完成了"，真正的 dispatch 由调度器上的
+    // drain 任务用 while 循环跑(同步包在循环里连续处理，不产生递归调用栈)。
     private boolean busy;
+    /** 当前包已经交给异步命令执行，等它的回调调用 packetFinished() */
+    private boolean awaitingAsync;
+    /** 正在 drain 循环里，此时同步包完成不需要再做任何事，循环会继续 */
+    private boolean draining;
+    /** 已经往调度器里提交了一个 drain 任务 */
+    private boolean drainScheduled;
     private final java.util.ArrayDeque<Object[]> pendingPackets = new java.util.ArrayDeque<>();
 
     @Override
@@ -161,38 +175,63 @@ public class PgServerConnection extends AsyncServerConnection {
                 return;
             }
             busy = true;
-            dispatchPacket(type, data);
+            if (dispatchPacket(type, data)) {
+                awaitingAsync = true;
+                return;
+            }
+            drain();
         } finally {
             if (autoRecycle)
                 buffer.recycle();
         }
     }
 
-    private void dispatchPacket(int type, byte[] data) {
-        boolean async;
+    /** @return true 表示已交给异步命令，完成后由 packetFinished() 继续 */
+    private boolean dispatchPacket(int type, byte[] data) {
         try {
-            async = packetHandler.handle(toNetBuffer(data), type);
+            return packetHandler.handle(toNetBuffer(data), type);
         } catch (Throwable t) {
             server.traceError(DbException.convert(t));
-            async = false;
+            return false;
         }
-        if (!async)
-            packetFinished();
+    }
+
+    /** 依次处理排队的包，直到队列为空(结束本次 busy)或某条命令变成异步(等回调) */
+    private void drain() {
+        if (draining)
+            return;
+        draining = true;
+        try {
+            while (!stop && busy && !awaitingAsync) {
+                Object[] next = pendingPackets.poll();
+                if (next == null) {
+                    busy = false;
+                    break;
+                }
+                if (dispatchPacket((Integer) next[0], (byte[]) next[1])) {
+                    awaitingAsync = true;
+                }
+            }
+        } finally {
+            draining = false;
+        }
     }
 
     /** 当前包(及其异步执行)完成后调用：继续处理排队的下一个包 */
     public void packetFinished() {
-        if (stop) {
-            busy = false;
-            pendingPackets.clear();
+        if (!busy || stop)
             return;
-        }
-        Object[] next = pendingPackets.poll();
-        if (next == null) {
-            busy = false;
+        if (draining) // 同步包在 drain 循环里完成，循环会继续
             return;
-        }
-        dispatchPacket((Integer) next[0], (byte[]) next[1]);
+        awaitingAsync = false;
+        // 不能在这里 dispatch: 当前还在异步回调的栈里，见字段上的注释。交给调度器异步执行。
+        if (drainScheduled)
+            return;
+        drainScheduled = true;
+        scheduler.handle(() -> {
+            drainScheduled = false;
+            drain();
+        });
     }
 
     private NetBuffer toNetBuffer(byte[] data) {

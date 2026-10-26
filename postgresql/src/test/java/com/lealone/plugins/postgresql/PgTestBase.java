@@ -70,10 +70,20 @@ public class PgTestBase extends SqlTestBase {
     }
 
     public static Connection getPgConnection() throws Exception {
+        return getPgConnection(0);
+    }
+
+    /**
+     * @param socketTimeoutSeconds 大于 0 时设置 socket 读超时, 避免服务端不响应时测试永久挂住
+     */
+    public static Connection getPgConnection(int socketTimeoutSeconds) throws Exception {
         String url = "jdbc:postgresql://localhost:" + TEST_PORT + "/postgres";
         Properties info = new Properties();
         info.put("user", "postgres");
         info.put("password", "postgres");
+        if (socketTimeoutSeconds > 0) {
+            info.put("socketTimeout", String.valueOf(socketTimeoutSeconds));
+        }
         return DriverManager.getConnection(url, info);
     }
 
