@@ -73,6 +73,15 @@ public class PgSQLParser extends SQLParserBase {
             .compile("(?i)(JOIN\\s+pg_catalog\\.pg_index\\s+i\\s+ON\\s*\\([^)]*\\))");
     private static final Pattern PG_INDEX_FROM = Pattern
             .compile("(?i)(FROM\\s+pg_catalog\\.pg_index\\s+i\\s*)\\)");
+    // getIndexInfo 的 COLUMN_NAME 用 pg_get_indexdef(ci_oid, ordinal, false), 而别名函数
+    // 只能读连接建立时的索引快照(别名函数里不能查库), 同一连接里新建的索引查不到;
+    // 直接改成查 pg_index_columns。
+    private static final Pattern GET_INDEXDEF_ORDINAL = Pattern.compile(
+            "(?i)pg_catalog\\s*\\.\\s*pg_get_indexdef\\s*\\(\\s*tmp\\.ci_oid\\s*,\\s*tmp\\.ordinal_position\\s*,\\s*false\\s*\\)");
+    // 核心不支持位与 '&'; pg_index.indoption 恒为 null, 换成 0 后 CASE 走 ELSE(升序 'A')
+    private static final Pattern INDOPTION_AND = Pattern.compile(
+            "(?i)tmp\\.i_indoption\\s*\\[\\s*tmp\\.ordinal_position\\s*-\\s*1\\s*]\\s*&\\s*1\\s*::\\s*smallint");
+
     static String normalize(String sql) {
         if (sql == null)
             return sql;
@@ -86,6 +95,8 @@ public class PgSQLParser extends SQLParserBase {
         s = rewriteOutsideLiterals(s, GENERATE_SERIES, matcher -> "SYSTEM_RANGE");
         s = wrapRangeTableColumnAliases(s);
         s = rewritePgExpandArray(s);
+        s = rewritePgIndexDefOrdinal(s);
+        s = INDOPTION_AND.matcher(s).replaceAll("0");
         s = rewriteOutsideLiterals(s, CURRENT_SCHEMAS_ANY, matcher -> {
             if (Boolean.parseBoolean(matcher.group(1))) {
                 return "ANY(SELECT 'pg_catalog' UNION SELECT 'public')";
@@ -270,6 +281,20 @@ public class PgSQLParser extends SQLParserBase {
         s = PG_INDEX_FROM.matcher(s).replaceAll(
                 "$1 JOIN pg_catalog.pg_index_columns ic ON (ic.indexrelid = i.indexrelid))");
         return s;
+    }
+
+    /**
+     * pgjdbc getIndexInfo 的 COLUMN_NAME 用 pg_get_indexdef(ci_oid, ordinal, false)。
+     * 别名函数只能读连接建立时的索引快照(别名函数里不能查库), 同一连接里新建的索引查不到,
+     * 这里改成直接查 pg_index_columns。
+     */
+    private static String rewritePgIndexDefOrdinal(String sql) {
+        if (sql.toUpperCase().indexOf("PG_GET_INDEXDEF") < 0) {
+            return sql;
+        }
+        return GET_INDEXDEF_ORDINAL.matcher(sql).replaceAll(
+                "(SELECT ic2.column_name FROM pg_catalog.pg_index_columns ic2"
+                        + " WHERE ic2.indexrelid = tmp.CI_OID AND ic2.key_seq = tmp.ORDINAL_POSITION)");
     }
 
     /** 忽略字符串字面量/引号标识符/注释, 找下一个完整单词(大小写不敏感) */

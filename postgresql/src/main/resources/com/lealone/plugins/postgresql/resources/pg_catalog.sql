@@ -479,10 +479,11 @@ create table pg_catalog.pg_authid(
 );
 grant select on pg_catalog.pg_authid to public;
 
-create table pg_catalog.pg_am(oid int, amname varchar_ignorecase);
+-- amcanorder: pgjdbc 的 getIndexInfo 用它决定 ASC_OR_DESC 是否需要读 indoption
+create table pg_catalog.pg_am(oid int, amname varchar_ignorecase, amcanorder boolean);
 grant select on pg_catalog.pg_am to public;
-insert into  pg_catalog.pg_am values(0, 'btree');
-insert into  pg_catalog.pg_am values(1, 'hash');
+insert into  pg_catalog.pg_am values(0, 'btree', true);
+insert into  pg_catalog.pg_am values(1, 'hash', false);
 
 create table pg_catalog.pg_description -- (objoid, objsubid, classoid, description)
 as

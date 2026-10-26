@@ -233,6 +233,34 @@ public class PgCatalogTest extends PgTestBase {
         }
     }
 
+    @Test
+    public void indexInfoReturnsRows() throws Exception {
+        try (Statement st = conn.createStatement()) {
+            st.executeUpdate("DROP TABLE IF EXISTS cat_idx");
+            st.executeUpdate("CREATE TABLE cat_idx(id int primary key, name varchar(20))");
+            st.executeUpdate("CREATE INDEX cat_idx_name ON cat_idx(name)");
+        }
+        java.util.Map<String, String> indexToColumn = new java.util.HashMap<>();
+        java.util.Map<String, Boolean> indexToUnique = new java.util.HashMap<>();
+        try (ResultSet rs = conn.getMetaData().getIndexInfo(null, null, "cat_idx", false, false)) {
+            while (rs.next()) {
+                String col = rs.getString("COLUMN_NAME");
+                if (col == null)
+                    continue;
+                indexToColumn.put(rs.getString("INDEX_NAME"), col);
+                indexToUnique.put(rs.getString("INDEX_NAME"), rs.getBoolean("NON_UNIQUE"));
+            }
+        }
+        if (!"id".equalsIgnoreCase(indexToColumn.get("cat_idx_pkey")))
+            throw new AssertionError("cat_idx_pkey 的列应该是 id, 实际 " + indexToColumn);
+        if (!Boolean.FALSE.equals(indexToUnique.get("cat_idx_pkey")))
+            throw new AssertionError("cat_idx_pkey 应该是唯一索引, 实际 " + indexToUnique);
+        if (!"name".equalsIgnoreCase(indexToColumn.get("cat_idx_name")))
+            throw new AssertionError("cat_idx_name 的列应该是 name, 实际 " + indexToColumn);
+        if (!Boolean.TRUE.equals(indexToUnique.get("cat_idx_name")))
+            throw new AssertionError("cat_idx_name 应该是非唯一索引, 实际 " + indexToUnique);
+    }
+
     // 已知限制: pgjdbc 的 getColumns 用了 ROW_NUMBER() OVER (PARTITION BY ...) 窗口函数,
     // Lealone 尚未支持窗口函数; 等窗口函数支持后去掉 @Ignore
     @org.junit.Ignore("Lealone 不支持窗口函数, pgjdbc getColumns 需要")
