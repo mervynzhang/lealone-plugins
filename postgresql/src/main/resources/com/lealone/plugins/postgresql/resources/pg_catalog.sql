@@ -110,11 +110,13 @@ from information_schema.type_info
 where pos = 0
     and pg_convertType(data_type) <> 705; -- not unknown
 
+-- name 类型的 typlen 必须是 64: pgjdbc 的 DatabaseMetaData.getMaxColumnNameLength()
+-- 直接拿它减 1(见 PgDatabaseMetaData.getMaxNameLength), 写成 -1 会返回 -2
 merge into pg_catalog.pg_type(oid, typname, typnamespace, typlen, typrelid, typtype, typbasetype, typtypmod) values(
     19,
     'name',
     (select oid from pg_catalog.pg_namespace where nspname = 'pg_catalog'),
-    -1,
+    64,
     0,
     'c',
     0,
@@ -451,7 +453,10 @@ grant select on pg_catalog.pg_settings to public;
 insert into pg_catalog.pg_settings values
 (0, 'autovacuum', 'on'),
 (1, 'stats_start_collector', 'on'),
-(2, 'stats_row_level', 'on');
+(2, 'stats_row_level', 'on'),
+-- pgjdbc 的 getMaxIndexKeys()/getImportedKeys() 会查它, 查不到直接抛
+-- "Unable to determine a value for MaxIndexKeys"; PG 默认 32
+(3, 'max_index_keys', '32');
 
 create view pg_catalog.pg_user -- oid, usename, usecreatedb, usesuper
 as

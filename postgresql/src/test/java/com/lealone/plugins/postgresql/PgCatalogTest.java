@@ -261,6 +261,20 @@ public class PgCatalogTest extends PgTestBase {
             throw new AssertionError("cat_idx_name 应该是非唯一索引, 实际 " + indexToUnique);
     }
 
+    @Test
+    public void maxColumnNameLengthIs63() throws Exception {
+        // pgjdbc 的 getMaxColumnNameLength() = pg_type 里 name 类型的 typlen - 1,
+        // 真 PG 是 64 - 1 = 63; 之前 pg_type 把 name 的 typlen 写成 -1, 返回 -2。
+        int len = conn.getMetaData().getMaxColumnNameLength();
+        if (len != 63)
+            throw new AssertionError("getMaxColumnNameLength 应该是 63, 实际 " + len);
+        // pgjdbc 的 getMaxColumnsInIndex() 读 pg_settings.max_index_keys, 缺这一行时
+        // getImportedKeys 直接抛 "Unable to determine a value for MaxIndexKeys"
+        int keys = conn.getMetaData().getMaxColumnsInIndex();
+        if (keys != 32)
+            throw new AssertionError("getMaxColumnsInIndex 应该是 32, 实际 " + keys);
+    }
+
     // 已知限制: pgjdbc 的 getColumns 用了 ROW_NUMBER() OVER (PARTITION BY ...) 窗口函数,
     // Lealone 尚未支持窗口函数; 等窗口函数支持后去掉 @Ignore
     @org.junit.Ignore("Lealone 不支持窗口函数, pgjdbc getColumns 需要")
