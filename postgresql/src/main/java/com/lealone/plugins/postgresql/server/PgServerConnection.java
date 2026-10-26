@@ -265,9 +265,13 @@ public class PgServerConnection extends AsyncServerConnection {
     }
 
     private NetBuffer toNetBuffer(byte[] data) {
-        com.lealone.db.DataBuffer db = com.lealone.db.DataBuffer.create(data.length + 16);
+        // limit 必须精确等于 payload 长度：多出来的容量会让读越界变成"读到 0"，
+        // Bind 里 paramLen 声明一个超大值时就发现不了协议违规。
+        com.lealone.db.DataBuffer db = com.lealone.db.DataBuffer
+                .create(Math.max(16, data.length));
         NetBuffer nb = new NetBuffer(db);
         nb.appendBytes(data, 0, data.length);
+        nb.limit(data.length);
         nb.position(0);
         return nb;
     }

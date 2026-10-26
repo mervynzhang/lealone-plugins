@@ -164,6 +164,14 @@ public class CommandPacketHandler extends PacketHandler {
                 values[i] = ValueNull.INSTANCE;
                 continue;
             }
+            // 必须先跟"本包剩余字节数"比对：一个 20 字节的包可以声称 paramLen=2G，
+            // 照这个值 new byte[] 直接 OOM(OOM 是 Error，PacketHandler.handle 只 catch
+            // Exception，会绕过错误响应)，所以这里按协议违规处理: 回 08P01 并断开。
+            if (paramLen < 0 || paramLen > in.remaining()) {
+                conn.sendProtocolErrorAndClose("invalid parameter length: " + paramLen
+                        + ", remaining packet bytes: " + in.remaining());
+                return;
+            }
             byte[] data = DataUtils.newBytes(paramLen);
             readFully(data);
             boolean text = isText(formatCodes, i);
@@ -189,12 +197,18 @@ public class CommandPacketHandler extends PacketHandler {
         sendBindComplete();
     }
 
-    private static boolean isText(int[] formatCodes, int i) {
+    /**
+     * PG 协议: format code 个数为 0 时全部是 text，为 1 时套用到所有参数；个数少于参数
+     * 个数时(协议规定本不该出现，但客户端可能这么发)沿用最后一个 format code，不能默认
+     * 按 binary 解，否则最后一个参数会被当成定长二进制、直接报长度错误。
+     */
+    static boolean isText(int[] formatCodes, int i) {
         if (formatCodes.length == 0)
             return true;
         if (formatCodes.length == 1)
             return formatCodes[0] == 0;
-        return i < formatCodes.length && formatCodes[i] == 0;
+        int index = Math.min(i, formatCodes.length - 1);
+        return formatCodes[index] == 0;
     }
 
     // ---------------------------------------------------------------- Describe / Execute

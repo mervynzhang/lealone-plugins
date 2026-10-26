@@ -5,6 +5,8 @@
  */
 package com.lealone.plugins.postgresql;
 
+import java.nio.charset.StandardCharsets;
+
 import org.junit.Test;
 
 /**
@@ -117,4 +119,76 @@ public class PgProtocolRobustnessTest extends PgTestBase {
         }
     }
 
+
+    /**
+     * Bind 的 paramLen 是一个独立的 int32，和包长度无关：一个 20 字节的包可以声称
+     * paramLen=1G。旧实现直接 DataUtils.newBytes(paramLen)，可能 OOM(OOM 是 Error，
+     * PacketHandler.handle 只 catch Exception)；即便没 OOM 也只是回了个普通错误且不断开。
+     * 正确行为: 和本包剩余字节数比对，超限回 08P01 并断开。
+     */
+    @Test(timeout = 60000)
+    public void oversizedParamLengthIsProtocolError() throws Exception {
+        try (PgRawClient client = new PgRawClient(15000)) {
+            client.authenticate("postgres", "postgres", "postgres");
+            client.sendExtendedQueryPrepareOnly("SELECT ?");
+            // portal\0 statement\0 nformats=0 nparams=1 paramLen=1000000000, 后面没有参数数据
+            byte[] bind = new byte[] { 0, 0, 0, 0, 0, 1, 0x3b, (byte) 0x9a, (byte) 0xca, 0x00 };
+            client.send('B', bind);
+            PgRawClient.Message error = client.read();
+            if (error == null) {
+                throw new AssertionError("paramLen 超限时连接被直接关闭, 没有 ErrorResponse");
+            }
+            if (error.type != 'E') {
+                throw new AssertionError("paramLen 超限应返回 ErrorResponse, 实际 " + error.type);
+            }
+            String state = PgRawClient.sqlState(error);
+            if (!"08P01".equals(state)) {
+                throw new AssertionError("paramLen 超限应返回 08P01, 实际 " + state + ": " + error.asString());
+            }
+            client.assertClosed("paramLen 超限回错误之后");
+        }
+    }
+
+    /**
+     * Bind 里 format code 个数(2)少于参数个数(3)时，第 3 个参数要沿用最后一个 format code
+     * (text)。旧实现把第 3 个参数按 binary 解析，int4 只收到 1 字节文本 "3"，直接报
+     * "paramLen" 无效值。
+     */
+    @Test(timeout = 60000)
+    public void bindFormatCodesReuseLastCodeForExtraParams() throws Exception {
+        try (PgRawClient client = new PgRawClient(15000)) {
+            client.authenticate("postgres", "postgres", "postgres");
+            // 23 = int4, 显式声明参数类型，避免依赖 SQL 推断
+            client.sendExtendedQueryPrepareOnly("SELECT ? + ? + ?", new int[] { 23, 23, 23 });
+            client.sendBind(new int[] { 1, 0 }, new byte[][] {
+                    new byte[] { 0, 0, 0, 1 }, // binary int4 = 1
+                    "2".getBytes(StandardCharsets.UTF_8), // text = 2
+                    "3".getBytes(StandardCharsets.UTF_8) }); // 沿用最后的 text = 3
+            PgRawClient.Message m = client.read();
+            if (m == null || m.type == 'E') {
+                throw new AssertionError("Bind 失败(最后一个参数被当成 binary 解析了): "
+                        + (m == null ? "连接关闭" : m.asString()));
+            }
+            if (m.type != '2') {
+                throw new AssertionError("Bind 应返回 BindComplete, 实际 " + m.type);
+            }
+            client.sendExecute();
+            String value = null;
+            while (value == null) {
+                m = client.read();
+                if (m == null) {
+                    throw new AssertionError("执行过程中连接被关闭");
+                }
+                if (m.type == 'E') {
+                    throw new AssertionError("执行出错: " + m.asString());
+                }
+                if (m.type == 'D') {
+                    value = PgRawClient.firstColumn(m);
+                }
+            }
+            if (!"6".equals(value)) {
+                throw new AssertionError("1+2+3 应该是 6, 实际 " + value);
+            }
+        }
+    }
 }

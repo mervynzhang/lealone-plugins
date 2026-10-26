@@ -42,4 +42,9 @@ public class NetBufferInput {
         for (int i = 0, len = b.length; i < len; i++)
             b[i] = readByte();
     }
+
+    /** 当前包里还剩多少字节没读(用来校验客户端声明的长度，避免照着声明值分配内存) */
+    public int remaining() {
+        return buffer.getByteBuffer().limit() - buffer.position();
+    }
 }
