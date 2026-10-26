@@ -29,25 +29,11 @@ public class PgSQLParser extends SQLParserBase {
     }
 
     // psql 和 pgjdbc 会生成 PG 特有的操作符写法，解析前统一改写成 Lealone 支持的写法：
-    //   a OPERATOR(pg_catalog.~) 're'   -> a REGEXP 're'
-    //   a OPERATOR(pg_catalog.!~) 're'  -> NOT (a REGEXP 're')
-    //   a ~ 're'                        -> a REGEXP 're'
-    //   a !~ 're'                       -> NOT (a REGEXP 're')
+    //   a OPERATOR(pg_catalog.~) 're'   -> a ~ 're'
+    //   a OPERATOR(pg_catalog.!~) 're'  -> a !~ 're'
+    // 核心的 readConcat 已经原生支持 ~ 和 !~；~* / !~* (大小写不敏感) 只能退化成 REGEXP。
     private static final Pattern PG_OPERATOR = Pattern
             .compile("(?i)OPERATOR\\s*\\(\\s*(?:pg_catalog\\.)?(~\\*?|!~\\*?|=|<>|<|>|<=|>=)\\s*\\)");
-    private static final Pattern PG_REGEX_MATCH = Pattern
-            .compile("([A-Za-z_][A-Za-z0-9_$.]*)\\s+~\\s+('[^']*')");
-    private static final Pattern REGTYPE_CAST = Pattern
-            .compile("(?i)'[^']*'\\s*::\\s*(?:pg_catalog\\.)?regtype");
-    private static final Pattern REGCLASS_CAST = Pattern
-            .compile("(?i)'[^']*'\\s*::\\s*(?:pg_catalog\\.)?regclass");
-
-    private static final Pattern REGTYPE_COL = Pattern
-            .compile("(?i)\\s*::\\s*(?:pg_catalog\\.)?(?:regtype|regclass|regproc|regprocedure|regoperator|regnamespace)");
-    private static final Pattern TEXT_CAST = Pattern
-            .compile("(?i)\\s*::\\s*(?:pg_catalog\\.)?(?:text|bpchar|name|char|varchar|int2|int4|int8|oid|bool)");
-    private static final Pattern PG_REGEX_NOT_MATCH = Pattern
-            .compile("([A-Za-z_][A-Za-z0-9_$.]*)\\s+!~\\s+('[^']*')");
     // 核心的 RangeTable 已经用 SYSTEM_RANGE/GENERATE_SERIES 别名支持 FROM 里的函数表,
     // 这里按 PG 的写法统一改写成 SYSTEM_RANGE(大小写不敏感, 不碰字符串字面量/注释)
     private static final Pattern GENERATE_SERIES = Pattern
@@ -56,6 +42,21 @@ public class PgSQLParser extends SQLParserBase {
     // 把 pgjdbc TypeInfoCache 的 ANY(current_schemas(...)) 改写成等价的 ANY(SELECT ...)
     private static final Pattern CURRENT_SCHEMAS_ANY = Pattern.compile(
             "(?i)(?<![A-Za-z0-9_$])ANY\\s*\\(\\s*(?:pg_catalog\\s*\\.\\s*)?current_schemas\\s*\\(\\s*(TRUE|FALSE)\\s*\\)\\s*\\)");
+
+    // 类型强转的匹配必须带右边界: 否则 ::char 会把 ::character 的前缀吃掉
+    // ('foo'::character varying(20) -> 'foo'acter varying(20))。
+    // 不能带 char|varchar 分支: 核心本来就支持 CHAR/VARCHAR/CHARACTER VARYING，
+    // 留着反而会误吃 ::character。
+    private static final Pattern TEXT_CAST = Pattern.compile(
+            "(?i)\\s*::\\s*(?:pg_catalog\\s*\\.\\s*)?(?:text|bpchar|name|int2|int4|int8|oid|bool)(?![A-Za-z0-9_])");
+    private static final Pattern REGTYPE_COL = Pattern.compile(
+            "(?i)\\s*::\\s*(?:pg_catalog\\s*\\.\\s*)?(?:regtype|regclass|regproc|regprocedure|regoperator|regnamespace)(?![A-Za-z0-9_])");
+    // 'pg_catalog.trigger'::pg_catalog.regtype 这种"字面量 + regtype/regclass 强转"
+    private static final Pattern REGTYPE_LITERAL_TAIL = Pattern.compile(
+            "(?i)\\s*::\\s*(?:pg_catalog\\s*\\.\\s*)?(?:regtype|regclass)(?![A-Za-z0-9_])");
+    // psql 的部分查询会给操作符加 COLLATE pg_catalog.default，Lealone 不支持 COLLATE
+    private static final Pattern COLLATE_CLAUSE = Pattern.compile(
+            "(?i)\\s+COLLATE\\s+(?:\"(?:[^\"]|\"\")*\"|[A-Za-z_][A-Za-z0-9_$]*(?:\\s*\\.\\s*(?:\"[^\"]*\"|[A-Za-z_][A-Za-z0-9_$]*))?)");
 
     // pgjdbc 的 getPrimaryKeys/getIndexInfo/getImportedKeys 用
     // information_schema._pg_expandarray(i.indkey) 把索引列"展开"成多行; Lealone 既没有
@@ -86,62 +87,56 @@ public class PgSQLParser extends SQLParserBase {
         if (sql == null)
             return sql;
         String upper = sql.toUpperCase();
-        if (sql.indexOf('~') < 0 && sql.indexOf("::") < 0 && upper.indexOf("OPERATOR") < 0
-                && sql.indexOf("E'") < 0 && upper.indexOf("GENERATE_SERIES") < 0
-                && upper.indexOf("SYSTEM_RANGE") < 0 && upper.indexOf("CURRENT_SCHEMAS") < 0
-                && upper.indexOf("_PG_EXPANDARRAY") < 0 && upper.indexOf("PG_GET_INDEXDEF") < 0)
+        if (sql.indexOf('~') < 0 && sql.indexOf("::") < 0 && sql.indexOf('&') < 0
+                && upper.indexOf("OPERATOR") < 0 && upper.indexOf("E'") < 0
+                && upper.indexOf("GENERATE_SERIES") < 0 && upper.indexOf("SYSTEM_RANGE") < 0
+                && upper.indexOf("CURRENT_SCHEMAS") < 0 && upper.indexOf("_PG_EXPANDARRAY") < 0
+                && upper.indexOf("PG_GET_INDEXDEF") < 0 && upper.indexOf("COLLATE") < 0)
             return sql;
         String s = sql;
         s = rewriteOutsideLiterals(s, GENERATE_SERIES, matcher -> "SYSTEM_RANGE");
         s = wrapRangeTableColumnAliases(s);
         s = rewritePgExpandArray(s);
         s = rewritePgIndexDefOrdinal(s);
-        s = INDOPTION_AND.matcher(s).replaceAll("0");
+        s = rewriteOutsideLiterals(s, INDOPTION_AND, matcher -> "0");
         s = rewriteOutsideLiterals(s, CURRENT_SCHEMAS_ANY, matcher -> {
             if (Boolean.parseBoolean(matcher.group(1))) {
                 return "ANY(SELECT 'pg_catalog' UNION SELECT 'public')";
             }
             return "ANY(SELECT 'pg_catalog')";
         });
-        Matcher m = PG_OPERATOR.matcher(s);
-        StringBuffer sb = new StringBuffer();
-        while (m.find()) {
-            String op = m.group(1);
-            String rep;
+        // 只改写 OPERATOR(...) 这种包装，保留 PG 原生 ~ / !~ 让核心的 readConcat 直接处理，
+        // 这样左边是任意表达式(比如 (a || b))也能正确解析，不会残留 NOTREGEXP。
+        s = rewriteOutsideLiterals(s, PG_OPERATOR, matcher -> {
+            String op = matcher.group(1);
             switch (op) {
             case "~":
-            case "~*":
-                rep = "REGEXP";
-                break;
+                return "~";
             case "!~":
+                return "!~";
+            case "~*":
+                return "REGEXP";
             case "!~*":
-                rep = "NOTREGEXP";
-                break;
+                return "NOT REGEXP";
             default:
-                rep = op;
-                break;
+                return op;
             }
-            m.appendReplacement(sb, Matcher.quoteReplacement(rep));
-        }
-        m.appendTail(sb);
-        s = sb.toString();
-        if (s.contains("NOTREGEXP")) {
-            // a NOTREGEXP 're' -> NOT (a REGEXP 're')
-            s = s.replaceAll("([A-Za-z_][A-Za-z0-9_$.]*)\\s+NOTREGEXP\\s+('[^']*')", "NOT ($1 REGEXP $2)");
-        }
-        s = PG_REGEX_NOT_MATCH.matcher(s).replaceAll("NOT ($1 REGEXP $2)");
-        s = PG_REGEX_MATCH.matcher(s).replaceAll("$1 REGEXP $2");
-        // 'pg_catalog.trigger'::pg_catalog.regtype 这类强转, Lealone 没有 regtype/regclass 类型,
-        // 直接换成 0(只会参与类型比较, 空的 pg_proc 里不会命中)
-        s = REGTYPE_CAST.matcher(s).replaceAll("0");
-        s = REGCLASS_CAST.matcher(s).replaceAll("0");
+        });
+        // Lealone 没有 regtype/regclass 类型, 直接换成 0(只会参与类型比较, 空的 pg_proc 里不会命中)
+        s = rewriteLiteralRegtypeCasts(s);
         // 剩下的列级强转 Lealone 没有对应类型, 直接去掉(值本来就是字符串/整数)
-        s = REGTYPE_COL.matcher(s).replaceAll("");
-        s = TEXT_CAST.matcher(s).replaceAll("");
+        s = rewriteOutsideLiterals(s, REGTYPE_COL, matcher -> "");
+        s = rewriteOutsideLiterals(s, TEXT_CAST, matcher -> "");
+        // COLLATE 只影响排序规则, Lealone 没有对应实现, 去掉才能解析 psql 生成的查询
+        s = rewriteOutsideLiterals(s, COLLATE_CLAUSE, matcher -> "");
         s = normalizeEStrings(s);
         return s;
     }
 
+    /**
+     * 只对"字符串/引号标识符/注释之外"的代码片段跑正则。所有改写都必须走这里，
+     * 不能直接 replaceAll 原始 SQL：SELECT 'x::text' 这种字符串字面量会被改坏。
+     */
     private static String rewriteOutsideLiterals(String sql, Pattern pattern,
             Function<Matcher, String> replacement) {
         StringBuilder sb = new StringBuilder(sql.length());
@@ -149,35 +144,113 @@ public class PgSQLParser extends SQLParserBase {
         int start = 0;
         int i = 0;
         while (i < len) {
-            char c = sql.charAt(i);
-            int end;
-            if (c == '\'' || c == '"') {
-                end = skipQuoted(sql, i, c);
-            } else if (c == '-' && i + 1 < len && sql.charAt(i + 1) == '-') {
-                end = sql.indexOf('\n', i + 2);
-                if (end < 0)
-                    end = len;
-            } else if (c == '/' && i + 1 < len && sql.charAt(i + 1) == '*') {
-                end = sql.indexOf("*/", i + 2);
-                end = end < 0 ? len : end + 2;
+            int end = skipLiteralOrComment(sql, i);
+            if (end > i) {
+                appendReplaced(sb, sql, start, i, pattern, replacement);
+                sb.append(sql, i, end);
+                i = end;
+                start = end;
             } else {
                 i++;
-                continue;
             }
-            appendReplaced(sb, sql, start, i, pattern, replacement);
-            sb.append(sql, i, end);
-            i = end;
-            start = end;
         }
         appendReplaced(sb, sql, start, len, pattern, replacement);
         return sb.toString();
     }
 
-    private static int skipQuoted(String sql, int start, char quote) {
+    /**
+     * 'pg_catalog.trigger'::pg_catalog.regtype 换成 0。这条改写要"连字面量一起"处理，
+     * 不能只跑在字面量之外的代码上；但扫描器仍然把"字符串 + 强转"当成一个整体表达式，
+     * 不会碰字符串内部的 ::regtype，也不会碰其它字面量。
+     */
+    private static String rewriteLiteralRegtypeCasts(String sql) {
+        if (sql.indexOf("::") < 0)
+            return sql;
+        int len = sql.length();
+        StringBuilder sb = new StringBuilder(len);
+        int i = 0;
+        while (i < len) {
+            if (sql.charAt(i) == '\'') {
+                int literalEnd = skipSingleQuoted(sql, i, isEStringQuote(sql, i));
+                int p = skipWhitespace(sql, literalEnd);
+                if (p < len) {
+                    Matcher matcher = REGTYPE_LITERAL_TAIL.matcher(sql);
+                    matcher.region(p, len);
+                    if (matcher.lookingAt()) {
+                        sb.append('0');
+                        i = matcher.end();
+                        continue;
+                    }
+                }
+                sb.append(sql, i, literalEnd);
+                i = literalEnd;
+                continue;
+            }
+            int end = skipLiteralOrComment(sql, i);
+            if (end > i) {
+                sb.append(sql, i, end);
+                i = end;
+            } else {
+                sb.append(sql.charAt(i));
+                i++;
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 从 i 开始如果是字面量/引号标识符/注释/$$...$$，返回它结束后的位置；否则返回 -1 */
+    private static int skipLiteralOrComment(String sql, int i) {
+        char c = sql.charAt(i);
+        if (c == '\'') {
+            return skipSingleQuoted(sql, i, isEStringQuote(sql, i));
+        }
+        if (c == '"') {
+            return skipDoubleQuoted(sql, i);
+        }
+        int len = sql.length();
+        if (c == '-' && i + 1 < len && sql.charAt(i + 1) == '-') {
+            int end = sql.indexOf('\n', i + 2);
+            return end < 0 ? len : end + 1;
+        }
+        if (c == '/' && i + 1 < len && sql.charAt(i + 1) == '*') {
+            // PostgreSQL 的块注释可以嵌套
+            int depth = 1;
+            int j = i + 2;
+            while (j < len && depth > 0) {
+                if (sql.startsWith("/*", j)) {
+                    depth++;
+                    j += 2;
+                } else if (sql.startsWith("*/", j)) {
+                    depth--;
+                    j += 2;
+                } else {
+                    j++;
+                }
+            }
+            return j;
+        }
+        if (c == '$') {
+            int delimiterLength = dollarQuoteDelimiterLength(sql, i);
+            if (delimiterLength > 0) {
+                String delimiter = sql.substring(i, i + delimiterLength);
+                int end = sql.indexOf(delimiter, i + delimiterLength);
+                return end < 0 ? len : end + delimiterLength;
+            }
+        }
+        return -1;
+    }
+
+    private static int skipSingleQuoted(String sql, int start, boolean backslashEscapes) {
+        int len = sql.length();
         int i = start + 1;
-        while (i < sql.length()) {
-            if (sql.charAt(i) == quote) {
-                if (i + 1 < sql.length() && sql.charAt(i + 1) == quote) {
+        while (i < len) {
+            char c = sql.charAt(i);
+            if (backslashEscapes && c == '\\' && i + 1 < len) {
+                i += 2;
+                continue;
+            }
+            if (c == '\'') {
+                if (i + 1 < len && sql.charAt(i + 1) == '\'') {
                     i += 2;
                     continue;
                 }
@@ -185,11 +258,58 @@ public class PgSQLParser extends SQLParserBase {
             }
             i++;
         }
-        return sql.length();
+        return len;
+    }
+
+    private static int skipDoubleQuoted(String sql, int start) {
+        int len = sql.length();
+        int i = start + 1;
+        while (i < len) {
+            if (sql.charAt(i) == '"') {
+                if (i + 1 < len && sql.charAt(i + 1) == '"') {
+                    i += 2;
+                    continue;
+                }
+                return i + 1;
+            }
+            i++;
+        }
+        return len;
+    }
+
+    /** E'...' 里反斜杠是转义符，找结尾引号时要跳过 \' */
+    private static boolean isEStringQuote(String sql, int quote) {
+        if (quote == 0)
+            return false;
+        char previous = sql.charAt(quote - 1);
+        if (previous != 'E' && previous != 'e')
+            return false;
+        return quote < 2 || !isIdentifierPart(sql.charAt(quote - 2));
+    }
+
+    /** $$ 或 $tag$ 的分隔符长度，不是 dollar-quote 返回 -1 */
+    private static int dollarQuoteDelimiterLength(String sql, int i) {
+        int len = sql.length();
+        int j = i + 1;
+        if (j >= len)
+            return -1;
+        if (sql.charAt(j) == '$')
+            return 2;
+        char c = sql.charAt(j);
+        if (!Character.isLetter(c) && c != '_')
+            return -1;
+        j++;
+        while (j < len && (Character.isLetterOrDigit(sql.charAt(j)) || sql.charAt(j) == '_'))
+            j++;
+        if (j < len && sql.charAt(j) == '$')
+            return j - i + 1;
+        return -1;
     }
 
     private static void appendReplaced(StringBuilder sb, String sql, int from, int to,
             Pattern pattern, Function<Matcher, String> replacement) {
+        if (from >= to)
+            return;
         String code = sql.substring(from, to);
         Matcher matcher = pattern.matcher(code);
         int last = 0;
@@ -271,15 +391,14 @@ public class PgSQLParser extends SQLParserBase {
         if (sql.toUpperCase().indexOf("_PG_EXPANDARRAY") < 0) {
             return sql;
         }
-        String s = sql;
-        s = EXPAND_FIELD_N.matcher(s).replaceAll("ic.key_seq");
-        s = EXPAND_FIELD_X.matcher(s).replaceAll("ic.attnum");
-        s = EXPAND_CALL.matcher(s).replaceAll("ic.attnum");
-        s = RECORD_FIELD_X.matcher(s).replaceAll("$1");
-        s = PG_INDEX_JOIN.matcher(s).replaceAll(
-                "$1 JOIN pg_catalog.pg_index_columns ic ON (ic.indexrelid = i.indexrelid)");
-        s = PG_INDEX_FROM.matcher(s).replaceAll(
-                "$1 JOIN pg_catalog.pg_index_columns ic ON (ic.indexrelid = i.indexrelid))");
+        String s = rewriteOutsideLiterals(sql, EXPAND_FIELD_N, matcher -> "ic.key_seq");
+        s = rewriteOutsideLiterals(s, EXPAND_FIELD_X, matcher -> "ic.attnum");
+        s = rewriteOutsideLiterals(s, EXPAND_CALL, matcher -> "ic.attnum");
+        s = rewriteOutsideLiterals(s, RECORD_FIELD_X, matcher -> matcher.group(1));
+        s = rewriteOutsideLiterals(s, PG_INDEX_JOIN, matcher -> matcher.group(1)
+                + " JOIN pg_catalog.pg_index_columns ic ON (ic.indexrelid = i.indexrelid)");
+        s = rewriteOutsideLiterals(s, PG_INDEX_FROM, matcher -> matcher.group(1)
+                + " JOIN pg_catalog.pg_index_columns ic ON (ic.indexrelid = i.indexrelid))");
         return s;
     }
 
@@ -292,8 +411,8 @@ public class PgSQLParser extends SQLParserBase {
         if (sql.toUpperCase().indexOf("PG_GET_INDEXDEF") < 0) {
             return sql;
         }
-        return GET_INDEXDEF_ORDINAL.matcher(sql).replaceAll(
-                "(SELECT ic2.column_name FROM pg_catalog.pg_index_columns ic2"
+        return rewriteOutsideLiterals(sql, GET_INDEXDEF_ORDINAL,
+                matcher -> "(SELECT ic2.column_name FROM pg_catalog.pg_index_columns ic2"
                         + " WHERE ic2.indexrelid = tmp.CI_OID AND ic2.key_seq = tmp.ORDINAL_POSITION)");
     }
 
@@ -302,19 +421,9 @@ public class PgSQLParser extends SQLParserBase {
         int len = sql.length();
         int i = from;
         while (i < len) {
-            char c = sql.charAt(i);
-            if (c == '\'' || c == '"') {
-                i = skipQuoted(sql, i, c);
-                continue;
-            }
-            if (c == '-' && i + 1 < len && sql.charAt(i + 1) == '-') {
-                int end = sql.indexOf('\n', i + 2);
-                i = end < 0 ? len : end + 1;
-                continue;
-            }
-            if (c == '/' && i + 1 < len && sql.charAt(i + 1) == '*') {
-                int end = sql.indexOf("*/", i + 2);
-                i = end < 0 ? len : end + 2;
+            int end = skipLiteralOrComment(sql, i);
+            if (end > i) {
+                i = end;
                 continue;
             }
             if (sql.regionMatches(true, i, word, 0, word.length())
@@ -346,21 +455,12 @@ public class PgSQLParser extends SQLParserBase {
         int i = open;
         int len = sql.length();
         while (i < len) {
+            int end = skipLiteralOrComment(sql, i);
+            if (end > i) {
+                i = end;
+                continue;
+            }
             char c = sql.charAt(i);
-            if (c == '\'' || c == '"') {
-                i = skipQuoted(sql, i, c);
-                continue;
-            }
-            if (c == '-' && i + 1 < len && sql.charAt(i + 1) == '-') {
-                int end = sql.indexOf('\n', i + 2);
-                i = end < 0 ? len : end + 1;
-                continue;
-            }
-            if (c == '/' && i + 1 < len && sql.charAt(i + 1) == '*') {
-                int end = sql.indexOf("*/", i + 2);
-                i = end < 0 ? len : end + 2;
-                continue;
-            }
             if (c == '(') {
                 depth++;
             } else if (c == ')') {
@@ -652,62 +752,89 @@ public class PgSQLParser extends SQLParserBase {
         return new PgVariable(session, readAliasIdentifier());
     }
 
-    /** E'\n' 这种 escape string 转成普通字符串字面量(处理 \\n \\t \\r \\\\ \\' 这几个常见转义) */
+    /**
+     * E'\n' 这种 escape string 转成普通字符串字面量(处理 \n \t \r \\ \' 这几个常见转义)。
+     * <p>
+     * 注意: E'' 里的 \' 必须输出成 SQL 标准的 ''(两个单引号)，不能输出裸引号，
+     * 否则 E'it\'s' 会变成语法错误的 'it's'。注释/双引号标识符/$$...$$ 里的 E' 不处理。
+     */
     static String normalizeEStrings(String sql) {
         if (sql.indexOf("E'") < 0 && sql.indexOf("e'") < 0)
             return sql;
-        StringBuilder sb = new StringBuilder(sql.length());
-        int i = 0;
         int len = sql.length();
-        boolean inString = false;
+        StringBuilder sb = new StringBuilder(len);
+        int i = 0;
         while (i < len) {
-            char ch = sql.charAt(i);
-            if (!inString && (ch == 'E' || ch == 'e') && i + 1 < len && sql.charAt(i + 1) == '\'') {
-                // 跳过 E 前缀, 把内容按转义规则解出来
-                i += 2;
+            char c = sql.charAt(i);
+            if ((c == 'E' || c == 'e') && i + 1 < len && sql.charAt(i + 1) == '\''
+                    && isEStringQuote(sql, i + 1)) {
+                // 跳过 E 前缀，把内容按转义规则解出来
                 sb.append('\'');
-                while (i < len) {
-                    char c = sql.charAt(i);
-                    if (c == '\\' && i + 1 < len) {
-                        char n = sql.charAt(i + 1);
-                        switch (n) {
-                        case 'n':
-                            sb.append('\n');
-                            break;
-                        case 't':
-                            sb.append('\t');
-                            break;
-                        case 'r':
-                            sb.append('\r');
-                            break;
-                        case '\\':
-                            sb.append('\\');
-                            break;
-                        case '\'':
-                            sb.append('\'');
-                            break;
-                        default:
-                            sb.append(n);
-                            break;
-                        }
-                        i += 2;
-                        continue;
-                    }
-                    if (c == '\'') {
-                        sb.append(c);
-                        i++;
-                        break;
-                    }
-                    sb.append(c);
-                    i++;
-                }
+                i = unescapeEString(sql, i + 2, sb);
                 continue;
             }
-            if (ch == '\'')
-                inString = !inString;
-            sb.append(ch);
-            i++;
+            int end = skipLiteralOrComment(sql, i);
+            if (end > i) {
+                sb.append(sql, i, end);
+                i = end;
+            } else {
+                sb.append(sql.charAt(i));
+                i++;
+            }
         }
         return sb.toString();
+    }
+
+    /** 从 E'' 的起始引号之后开始解转义，返回结束引号之后的位置 */
+    private static int unescapeEString(String sql, int start, StringBuilder sb) {
+        int len = sql.length();
+        int i = start;
+        while (i < len) {
+            char c = sql.charAt(i);
+            if (c == '\\' && i + 1 < len) {
+                char n = sql.charAt(i + 1);
+                switch (n) {
+                case 'b':
+                    sb.append('\b');
+                    break;
+                case 'f':
+                    sb.append('\f');
+                    break;
+                case 'n':
+                    sb.append('\n');
+                    break;
+                case 'r':
+                    sb.append('\r');
+                    break;
+                case 't':
+                    sb.append('\t');
+                    break;
+                case '\\':
+                    sb.append('\\');
+                    break;
+                case '\'':
+                    // SQL 标准转义: 普通字符串字面量里的单引号写成两个单引号
+                    sb.append("''");
+                    break;
+                default:
+                    sb.append(n);
+                    break;
+                }
+                i += 2;
+                continue;
+            }
+            if (c == '\'') {
+                if (i + 1 < len && sql.charAt(i + 1) == '\'') {
+                    sb.append("''");
+                    i += 2;
+                    continue;
+                }
+                sb.append('\'');
+                return i + 1;
+            }
+            sb.append(c);
+            i++;
+        }
+        return i;
     }
 }
