@@ -5,12 +5,18 @@
  */
 package com.lealone.plugins.postgresql;
 
+import java.sql.Connection;
 import java.sql.DatabaseMetaData;
+import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.Properties;
 
 import org.junit.Test;
+
+import com.lealone.db.LealoneDatabase;
+import com.lealone.test.TestBase;
 
 /**
  * pg_catalog 兼容性回归：psql 的 \d、\dt、\l、\du 和 JDBC 的 DatabaseMetaData
@@ -316,6 +322,107 @@ public class PgCatalogTest extends PgTestBase {
                 throw new AssertionError("Describe 没有返回元数据");
             if (!"int4".equals(ps.getMetaData().getColumnTypeName(1)))
                 throw new AssertionError("列类型名不对: " + ps.getMetaData().getColumnTypeName(1));
+        }
+    }
+
+    /**
+     * current_schema() 不能像以前那样在别名函数里嵌套查库(call schema())：那会把外层
+     * 结果集游标冲掉。改成直接返回 search_path 的第一项(public, pg_catalog)。
+     */
+    @Test
+    public void currentSchemaReturnsSearchPath() throws Exception {
+        try (Statement st = conn.createStatement();
+                ResultSet rs = st.executeQuery("SELECT pg_catalog.current_schema()")) {
+            rs.next();
+            if (!"public".equals(rs.getString(1)))
+                throw new AssertionError("current_schema() 应该是 public, 实际 " + rs.getString(1));
+        }
+        try (Statement st = conn.createStatement()) {
+            st.executeUpdate("DROP TABLE IF EXISTS cat_schema");
+            st.executeUpdate("CREATE TABLE cat_schema(id int)");
+            st.executeUpdate("INSERT INTO cat_schema VALUES(1),(2),(3)");
+        }
+        int rows = 0;
+        try (Statement st = conn.createStatement();
+                ResultSet rs = st.executeQuery("SELECT pg_catalog.current_schema(), id FROM cat_schema")) {
+            while (rs.next()) {
+                rows++;
+                if (!"public".equals(rs.getString(1)))
+                    throw new AssertionError("多行结果里的 current_schema() 不对: " + rs.getString(1));
+            }
+        }
+        if (rows != 3)
+            throw new AssertionError("current_schema() 把外层游标冲掉了, 只返回 " + rows + " 行");
+    }
+
+    /**
+     * catalog 快照必须按 database 分桶。以前是 static volatile Map，每来一个连接就整体
+     * 覆盖：先连 postgres 的会话在建好索引后，只要有人连一下别的库，再查自己的
+     * pg_get_indexdef 就变成空串(串台/丢失)。
+     */
+    @Test
+    public void catalogSnapshotIsolatedPerDatabase() throws Exception {
+        TestBase test = new TestBase().setPort(LEALONE_TEST_PORT);
+        try (Connection c = test.getConnection(LealoneDatabase.NAME);
+                Statement st = c.createStatement()) {
+            st.executeUpdate("CREATE DATABASE IF NOT EXISTS pg_iso_other");
+        }
+        try (Connection c = test.getConnection("pg_iso_other"); Statement st = c.createStatement()) {
+            st.executeUpdate("CREATE USER IF NOT EXISTS postgres PASSWORD 'postgres'");
+            st.executeUpdate("ALTER USER postgres ADMIN TRUE");
+        }
+        try (Statement st = conn.createStatement()) {
+            st.executeUpdate("DROP TABLE IF EXISTS cat_iso");
+            st.executeUpdate("CREATE TABLE cat_iso(id int, v int)");
+            st.executeUpdate("CREATE INDEX cat_iso_v ON cat_iso(v)");
+        }
+        // 快照是连接建立时拍的，这里重新建立连接，让快照里有刚建的索引
+        try (Connection session1 = getPgConnection()) {
+            int indexId;
+            try (Statement st = session1.createStatement();
+                    ResultSet rs = st.executeQuery(
+                            "SELECT oid FROM pg_catalog.pg_class WHERE relname = 'cat_iso_v'")) {
+                if (!rs.next())
+                    throw new AssertionError("pg_class 里找不到 cat_iso_v");
+                indexId = rs.getInt(1);
+            }
+            String before = indexDef(session1, indexId);
+            if (before == null || before.toUpperCase().indexOf("CAT_ISO_V") < 0)
+                throw new AssertionError("pg_get_indexdef 读不到索引定义: [" + before + "]");
+
+            // 第二个连接连另一个库: 旧实现会用这个库的快照覆盖全局 static Map
+            String url = "jdbc:postgresql://localhost:" + TEST_PORT + "/pg_iso_other";
+            Properties info = new Properties();
+            info.put("user", "postgres");
+            info.put("password", "postgres");
+            try (Connection other = DriverManager.getConnection(url, info);
+                    Statement st = other.createStatement();
+                    ResultSet rs = st.executeQuery("SELECT 1")) {
+                rs.next();
+            }
+
+            String after = indexDef(session1, indexId);
+            if (!before.equals(after))
+                throw new AssertionError(
+                        "catalog 快照串台了: 连接别的库之前 [" + before + "], 之后 [" + after + "]");
+
+            // 未命中必须返回 null, 而不是返回别的库的数据
+            try (Statement st = session1.createStatement();
+                    ResultSet rs = st.executeQuery(
+                            "SELECT pg_catalog.pg_get_userbyid(999999) IS NULL")) {
+                rs.next();
+                if (!rs.getBoolean(1))
+                    throw new AssertionError("pg_get_userbyid(未命中) 应该返回 NULL");
+            }
+        }
+    }
+
+    private String indexDef(Connection c, int indexId) throws Exception {
+        try (Statement st = c.createStatement();
+                ResultSet rs = st.executeQuery(
+                        "SELECT pg_catalog.pg_get_indexdef(" + indexId + ", 0, false)")) {
+            rs.next();
+            return rs.getString(1);
         }
     }
 }

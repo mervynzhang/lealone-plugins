@@ -25,6 +25,7 @@ import com.lealone.db.schema.Schema;
 import com.lealone.db.session.ServerSession;
 import com.lealone.net.WritableChannel;
 import com.lealone.plugins.postgresql.PgPlugin;
+import com.lealone.plugins.postgresql.sql.PgAlias;
 import com.lealone.plugins.postgresql.sql.expression.function.PgFunctionFactory;
 import com.lealone.server.AsyncServer;
 import com.lealone.sql.PreparedSQLStatement;
@@ -151,7 +152,7 @@ public class PgServer extends AsyncServer<PgServerConnection> {
             users.put(ur.currentRow()[0].getInt(), ur.currentRow()[1].getString());
         }
         ur.close();
-        com.lealone.plugins.postgresql.sql.PgAlias.setUserNames(users);
+        String databaseName = session.getDatabase().getName();
         // 索引元数据快照(psql \d 会按索引 id 取索引定义/列名)
         java.util.HashMap<Integer, String> idxSql = new java.util.HashMap<>();
         java.util.HashMap<String, String> idxColumns = new java.util.HashMap<>();
@@ -167,7 +168,9 @@ public class PgServer extends AsyncServer<PgServerConnection> {
                 idxSql.put(id, sql);
         }
         ir.close();
-        com.lealone.plugins.postgresql.sql.PgAlias.setIndexCache(idxSql, idxColumns);
+        // 快照按 database 分桶: 之前的 static volatile Map 会被后连上来的连接整体覆盖，
+        // 连不同库的两个连接会互相串台
+        PgAlias.setCatalog(databaseName, users, idxSql, idxColumns);
     }
 
     public static void installPgCatalog(ServerSession session, boolean trace) throws SQLException {

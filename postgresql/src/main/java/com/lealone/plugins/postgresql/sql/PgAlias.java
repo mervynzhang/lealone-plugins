@@ -11,6 +11,10 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.sql.Types;
+import java.util.Collections;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 import com.lealone.db.Constants;
 import com.lealone.plugins.postgresql.server.PgServer;
@@ -43,18 +47,24 @@ public class PgAlias {
      */
     public static String getIndexColumn(Connection conn, int indexId, Integer ordinalPosition,
             Boolean pretty) {
+        DatabaseCatalog catalog = getCatalog(conn);
+        if (catalog == null) {
+            return "";
+        }
         if (ordinalPosition == null || ordinalPosition.intValue() == 0) {
-            String sql = INDEX_SQL.get(indexId);
+            String sql = catalog.indexSql.get(indexId);
             return sql == null ? "" : sql;
         }
-        String column = INDEX_COLUMNS.get(indexId + ":" + ordinalPosition.intValue());
+        String column = catalog.indexColumns.get(indexId + ":" + ordinalPosition.intValue());
         return column == null ? "" : column;
     }
 
-    public static String getCurrentSchema(Connection conn) throws SQLException {
-        ResultSet rs = conn.createStatement().executeQuery("call schema()");
-        rs.next();
-        return rs.getString(1);
+    public static String getCurrentSchema(Connection conn) {
+        // 不能像以前那样嵌套查库(call schema()): 别名函数拿到的是同一 session 的嵌套连接，
+        // 遍历外层结果集时再查库会把外层游标冲掉(外层静默变成 0 行)。
+        // PgSQLParser 在会话建立时固定把 search_path 初始化为 public, pg_catalog，
+        // 所以直接返回 search_path 里的第一个 schema。
+        return "public";
     }
 
     /**
@@ -252,24 +262,65 @@ public class PgAlias {
      * @return the user name
      */
     // 别名函数拿到的是同一 session 的嵌套连接，遍历外层结果集时再查库会把外层游标冲掉
-    // (外层会静默变成 0 行)，所以用户表和索引元数据在会话建立时快照到缓存里。
-    private static volatile java.util.Map<Integer, String> USER_NAMES = java.util.Collections.emptyMap();
-    private static volatile java.util.Map<Integer, String> INDEX_SQL = java.util.Collections.emptyMap();
-    private static volatile java.util.Map<String, String> INDEX_COLUMNS = java.util.Collections.emptyMap();
+    // (外层会静默变成 0 行)，所以用户表和索引元数据在会话建立时快照下来。
+    //
+    // 快照必须按 database 分桶: 用 static volatile Map 时每来一个连接就整体覆盖，
+    // 两个并发连接连不同库会互相串台(先连的会话看不到自己的索引定义)，未命中也可能
+    // 拿到别的库的数据。分桶后每个库只读写自己的快照，未命中返回 null/空串。
+    private static final class DatabaseCatalog {
+        final Map<Integer, String> userNames;
+        final Map<Integer, String> indexSql;
+        final Map<String, String> indexColumns;
 
-    public static void setUserNames(java.util.Map<Integer, String> names) {
-        USER_NAMES = names;
+        DatabaseCatalog(Map<Integer, String> userNames, Map<Integer, String> indexSql,
+                Map<String, String> indexColumns) {
+            this.userNames = userNames;
+            this.indexSql = indexSql;
+            this.indexColumns = indexColumns;
+        }
     }
 
-    public static void setIndexCache(java.util.Map<Integer, String> sql,
-            java.util.Map<String, String> columns) {
-        INDEX_SQL = sql;
-        INDEX_COLUMNS = columns;
+    private static final Map<String, DatabaseCatalog> DATABASE_CATALOGS = new ConcurrentHashMap<>();
+
+    /** 建快照时统一小写，和 pg_roles 的 lower(name) 保持一致 */
+    public static void setCatalog(String databaseName, Map<Integer, String> userNames,
+            Map<Integer, String> indexSql, Map<String, String> indexColumns) {
+        if (databaseName == null) {
+            return;
+        }
+        Map<Integer, String> users = new java.util.HashMap<>(userNames.size());
+        for (Map.Entry<Integer, String> e : userNames.entrySet()) {
+            String name = e.getValue();
+            users.put(e.getKey(), name == null ? null : name.toLowerCase(Locale.ROOT));
+        }
+        DATABASE_CATALOGS.put(databaseName.toUpperCase(Locale.ROOT),
+                new DatabaseCatalog(Collections.unmodifiableMap(users),
+                        Collections.unmodifiableMap(new java.util.HashMap<>(indexSql)),
+                        Collections.unmodifiableMap(new java.util.HashMap<>(indexColumns))));
+    }
+
+    private static DatabaseCatalog getCatalog(Connection conn) {
+        if (conn == null) {
+            return null;
+        }
+        String databaseName;
+        try {
+            databaseName = conn.getCatalog();
+        } catch (SQLException e) {
+            return null;
+        }
+        if (databaseName == null) {
+            return null;
+        }
+        return DATABASE_CATALOGS.get(databaseName.toUpperCase(Locale.ROOT));
     }
 
     public static String getUserById(Connection conn, int id) {
-        String name = USER_NAMES.get(id);
-        return name == null ? null : name.toLowerCase();
+        DatabaseCatalog catalog = getCatalog(conn);
+        if (catalog == null) {
+            return null;
+        }
+        return catalog.userNames.get(id);
     }
 
     public static boolean hasDatabasePrivilege(int id, String privilege) {

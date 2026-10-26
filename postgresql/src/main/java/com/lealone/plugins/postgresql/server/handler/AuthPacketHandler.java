@@ -75,7 +75,8 @@ public class AuthPacketHandler extends PacketHandler {
                 sendAuthenticationOk();
             } catch (Exception e) {
                 sendErrorResponse(e);
-                conn.stop();
+                // 不能只 stop(): close() 在 session==null 时以前直接 return，socket 一直开着
+                conn.flushAndClose();
             }
             break;
         }

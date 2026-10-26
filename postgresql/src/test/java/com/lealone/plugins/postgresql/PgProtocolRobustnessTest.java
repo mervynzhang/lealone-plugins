@@ -191,4 +191,28 @@ public class PgProtocolRobustnessTest extends PgTestBase {
             }
         }
     }
+
+    /**
+     * 认证失败不能只 stop(): 旧 close() 在 session==null 时直接 return，底层 socket
+     * 一直开着，坏密码客户端可以长期占着 fd。要求回 ErrorResponse 然后关闭连接。
+     */
+    @Test(timeout = 60000)
+    public void wrongPasswordClosesSocket() throws Exception {
+        try (PgRawClient client = new PgRawClient(10000)) {
+            client.sendStartup("postgres", "postgres");
+            PgRawClient.Message auth = client.readExpect('R');
+            if (auth.firstInt() != 3) {
+                throw new AssertionError("期望明文密码认证请求, 实际 " + auth.firstInt());
+            }
+            client.sendPassword("definitely-wrong-password");
+            PgRawClient.Message error = client.read();
+            if (error == null) {
+                throw new AssertionError("认证失败没有返回 ErrorResponse");
+            }
+            if (error.type != 'E') {
+                throw new AssertionError("认证失败应返回 ErrorResponse, 实际 " + error.type);
+            }
+            client.assertClosed("认证失败回错误之后");
+        }
+    }
 }

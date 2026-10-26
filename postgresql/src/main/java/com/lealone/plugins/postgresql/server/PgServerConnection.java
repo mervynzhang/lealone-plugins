@@ -102,22 +102,34 @@ public class PgServerConnection extends AsyncServerConnection {
 
     @Override
     public void close() {
+        if (closed)
+            return;
         // 关闭时排队中的包不可能再被处理，必须清掉(否则 payload 一直占着内存)
         pendingPackets.clear();
         busy = false;
         awaitingAsync = false;
-        if (session == null)
-            return;
         try {
             stop = true;
-            session.close();
-            server.trace("Close");
-            super.close();
+            ServerSession current = session;
+            session = null;
+            if (current != null) {
+                current.close();
+                server.trace("Close");
+            }
         } catch (Exception e) {
             server.traceError(e);
+        } finally {
+            // 认证失败时 session 还是 null，也必须关掉底层 socket，
+            // 否则坏密码客户端可以一直占着 fd。
+            super.close();
+            server.removeConnection(this);
         }
-        session = null;
-        server.removeConnection(this);
+    }
+
+    /** 把已经写好的响应(比如认证失败的 ErrorResponse)刷到 socket 后再断开 */
+    public void flushAndClose() {
+        flushPendingWrites();
+        close();
     }
 
     @Override
