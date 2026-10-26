@@ -85,6 +85,65 @@ public class PgCatalogTest extends PgTestBase {
         }
     }
 
+    @Test
+    public void currentSchemasFunction() throws Exception {
+        try (Statement st = conn.createStatement();
+                ResultSet rs = st.executeQuery("SELECT pg_catalog.current_schemas(true)")) {
+            if (!rs.next())
+                throw new AssertionError("current_schemas(true) 没有返回结果");
+            String schemas = rs.getString(1);
+            if (schemas == null || schemas.isEmpty())
+                throw new AssertionError("current_schemas(true) 返回空");
+            if (!schemas.contains("public"))
+                throw new AssertionError("current_schemas(true) 应该包含 public: " + schemas);
+        }
+    }
+
+    @Test
+    public void typeInfoCacheQueryWorks() throws Exception {
+        // pgjdbc 42.3.8 TypeInfoCache 的原始查询, 这里把 $1 换成真实存在的 oid=23(integer)
+        String sql = "SELECT n.nspname = ANY(current_schemas(true)), n.nspname, t.typname"
+                + " FROM pg_catalog.pg_type t"
+                + " JOIN pg_catalog.pg_namespace n ON t.typnamespace = n.oid"
+                + " WHERE t.oid = 23";
+        try (Statement st = conn.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+            if (!rs.next())
+                throw new AssertionError("TypeInfoCache 查询没有返回行");
+            if (!rs.getBoolean(1))
+                throw new AssertionError("integer 的类型命名空间不在 current_schemas 中");
+            if (!"pg_catalog".equals(rs.getString(2)))
+                throw new AssertionError("integer 的命名空间应该是 pg_catalog: " + rs.getString(2));
+            if (!"integer".equals(rs.getString(3)))
+                throw new AssertionError("oid=23 的类型名应该是 integer: " + rs.getString(3));
+        }
+    }
+
+    @Test
+    public void generateSeriesWorks() throws Exception {
+        try (Statement st = conn.createStatement()) {
+            int rows = 0;
+            try (ResultSet rs = st.executeQuery("SELECT * FROM generate_series(1,5)")) {
+                while (rs.next())
+                    rows++;
+            }
+            if (rows != 5)
+                throw new AssertionError("generate_series(1,5) 应该返回 5 行, 实际 " + rows);
+            rows = 0;
+            try (ResultSet rs = st.executeQuery("SELECT * FROM generate_series(1,5,2)")) {
+                while (rs.next())
+                    rows++;
+            }
+            if (rows != 3)
+                throw new AssertionError("generate_series(1,5,2) 应该返回 3 行, 实际 " + rows);
+            // 改写不能碰字符串字面量
+            try (ResultSet rs = st.executeQuery("SELECT 'generate_series(1,5)'")) {
+                rs.next();
+                if (!"generate_series(1,5)".equals(rs.getString(1)))
+                    throw new AssertionError("字符串字面量被改写了: " + rs.getString(1));
+            }
+        }
+    }
+
     // 已知限制: pgjdbc 的 getColumns 用了 ROW_NUMBER() OVER (PARTITION BY ...) 窗口函数,
     // Lealone 尚未支持窗口函数; 等窗口函数支持后去掉 @Ignore
     @org.junit.Ignore("Lealone 不支持窗口函数, pgjdbc getColumns 需要")
@@ -113,9 +172,8 @@ public class PgCatalogTest extends PgTestBase {
             throw new AssertionError("DatabaseMetaData.getColumns 应该返回 2 列, 实际 " + columns);
     }
 
-    // 已知限制: pgjdbc 解析列类型名会发 "n.nspname = ANY(current_schemas(true))" 查询,
-    // Lealone 不支持 ANY(子查询/函数返回数组) 这种写法, 需要先补 current_schemas + ANY
-    @org.junit.Ignore("Lealone 不支持 ANY(current_schemas(true)), TypeInfoCache 查询失败")
+    // pgjdbc 解析列类型名会发 "n.nspname = ANY(current_schemas(true))" 查询,
+    // TypeInfoCache 能工作后 Describe 才能返回正确的列类型名(pgjdbc 用的是 PG 类型名 int4/varchar)
     @Test
     public void describePreparedStatementTypes() throws Exception {
         try (Statement st = conn.createStatement()) {
@@ -125,7 +183,7 @@ public class PgCatalogTest extends PgTestBase {
         try (PreparedStatement ps = conn.prepareStatement("SELECT id, v FROM cat_t4 WHERE id=?")) {
             if (ps.getMetaData() == null)
                 throw new AssertionError("Describe 没有返回元数据");
-            if (!"integer".equals(ps.getMetaData().getColumnTypeName(1)))
+            if (!"int4".equals(ps.getMetaData().getColumnTypeName(1)))
                 throw new AssertionError("列类型名不对: " + ps.getMetaData().getColumnTypeName(1));
         }
     }

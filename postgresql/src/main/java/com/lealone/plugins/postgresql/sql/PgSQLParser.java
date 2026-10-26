@@ -6,6 +6,7 @@
 package com.lealone.plugins.postgresql.sql;
 
 import java.util.ArrayList;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -47,12 +48,31 @@ public class PgSQLParser extends SQLParserBase {
             .compile("(?i)\\s*::\\s*(?:pg_catalog\\.)?(?:text|bpchar|name|char|varchar|int2|int4|int8|oid|bool)");
     private static final Pattern PG_REGEX_NOT_MATCH = Pattern
             .compile("([A-Za-z_][A-Za-z0-9_$.]*)\\s+!~\\s+('[^']*')");
+    // 核心的 RangeTable 已经用 SYSTEM_RANGE/GENERATE_SERIES 别名支持 FROM 里的函数表,
+    // 这里按 PG 的写法统一改写成 SYSTEM_RANGE(大小写不敏感, 不碰字符串字面量/注释)
+    private static final Pattern GENERATE_SERIES = Pattern
+            .compile("(?i)(?<![A-Za-z0-9_$])(?:pg_catalog\\s*\\.\\s*)?generate_series\\s*(?=\\()");
+    // 核心的 ANY 只支持 ANY(SELECT ...), 不支持 ANY(函数返回数组),
+    // 把 pgjdbc TypeInfoCache 的 ANY(current_schemas(...)) 改写成等价的 ANY(SELECT ...)
+    private static final Pattern CURRENT_SCHEMAS_ANY = Pattern.compile(
+            "(?i)(?<![A-Za-z0-9_$])ANY\\s*\\(\\s*(?:pg_catalog\\s*\\.\\s*)?current_schemas\\s*\\(\\s*(TRUE|FALSE)\\s*\\)\\s*\\)");
 
     static String normalize(String sql) {
-        if (sql == null || sql.indexOf('~') < 0 && sql.indexOf("::") < 0
-                && sql.toUpperCase().indexOf("OPERATOR") < 0 && sql.indexOf("E'") < 0)
+        if (sql == null)
+            return sql;
+        String upper = sql.toUpperCase();
+        if (sql.indexOf('~') < 0 && sql.indexOf("::") < 0 && upper.indexOf("OPERATOR") < 0
+                && sql.indexOf("E'") < 0 && upper.indexOf("GENERATE_SERIES") < 0
+                && upper.indexOf("CURRENT_SCHEMAS") < 0)
             return sql;
         String s = sql;
+        s = rewriteOutsideLiterals(s, GENERATE_SERIES, matcher -> "SYSTEM_RANGE");
+        s = rewriteOutsideLiterals(s, CURRENT_SCHEMAS_ANY, matcher -> {
+            if (Boolean.parseBoolean(matcher.group(1))) {
+                return "ANY(SELECT 'pg_catalog' UNION SELECT 'public')";
+            }
+            return "ANY(SELECT 'pg_catalog')";
+        });
         Matcher m = PG_OPERATOR.matcher(s);
         StringBuffer sb = new StringBuffer();
         while (m.find()) {
@@ -90,6 +110,65 @@ public class PgSQLParser extends SQLParserBase {
         s = TEXT_CAST.matcher(s).replaceAll("");
         s = normalizeEStrings(s);
         return s;
+    }
+
+    private static String rewriteOutsideLiterals(String sql, Pattern pattern,
+            Function<Matcher, String> replacement) {
+        StringBuilder sb = new StringBuilder(sql.length());
+        int len = sql.length();
+        int start = 0;
+        int i = 0;
+        while (i < len) {
+            char c = sql.charAt(i);
+            int end;
+            if (c == '\'' || c == '"') {
+                end = skipQuoted(sql, i, c);
+            } else if (c == '-' && i + 1 < len && sql.charAt(i + 1) == '-') {
+                end = sql.indexOf('\n', i + 2);
+                if (end < 0)
+                    end = len;
+            } else if (c == '/' && i + 1 < len && sql.charAt(i + 1) == '*') {
+                end = sql.indexOf("*/", i + 2);
+                end = end < 0 ? len : end + 2;
+            } else {
+                i++;
+                continue;
+            }
+            appendReplaced(sb, sql, start, i, pattern, replacement);
+            sb.append(sql, i, end);
+            i = end;
+            start = end;
+        }
+        appendReplaced(sb, sql, start, len, pattern, replacement);
+        return sb.toString();
+    }
+
+    private static int skipQuoted(String sql, int start, char quote) {
+        int i = start + 1;
+        while (i < sql.length()) {
+            if (sql.charAt(i) == quote) {
+                if (i + 1 < sql.length() && sql.charAt(i + 1) == quote) {
+                    i += 2;
+                    continue;
+                }
+                return i + 1;
+            }
+            i++;
+        }
+        return sql.length();
+    }
+
+    private static void appendReplaced(StringBuilder sb, String sql, int from, int to,
+            Pattern pattern, Function<Matcher, String> replacement) {
+        String code = sql.substring(from, to);
+        Matcher matcher = pattern.matcher(code);
+        int last = 0;
+        while (matcher.find()) {
+            sb.append(code, last, matcher.start());
+            sb.append(replacement.apply(matcher));
+            last = matcher.end();
+        }
+        sb.append(code, last, code.length());
     }
 
     @Override

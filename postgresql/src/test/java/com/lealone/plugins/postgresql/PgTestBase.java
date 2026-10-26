@@ -23,11 +23,17 @@ import com.lealone.test.sql.SqlTestBase;
 public class PgTestBase extends SqlTestBase {
 
     public final static int TEST_PORT = 9510;
+    // 测试进程连的 Lealone 服务端口。默认 9210; 端口被占用时可用 -Dlealone.test.port=xxxx 覆盖
+    public final static int LEALONE_TEST_PORT = Integer.getInteger("lealone.test.port", 9210);
     public final static String NAME = PgPlugin.NAME;
+
+    private static TestBase newTestBase() {
+        return new TestBase().setPort(LEALONE_TEST_PORT);
+    }
 
     @BeforeClass
     public static void createPgPlugin() throws Exception {
-        TestBase test = new TestBase();
+        TestBase test = newTestBase();
         Connection conn = test.getConnection(LealoneDatabase.NAME);
         Statement stmt = conn.createStatement();
         // File classPath = new File("target/classes");
@@ -43,7 +49,7 @@ public class PgTestBase extends SqlTestBase {
 
     @AfterClass
     public static void dropPgPlugin() throws Exception {
-        TestBase test = new TestBase();
+        TestBase test = newTestBase();
         Connection conn = test.getConnection(LealoneDatabase.NAME);
         Statement stmt = conn.createStatement();
         stmt.executeUpdate("stop plugin " + NAME);

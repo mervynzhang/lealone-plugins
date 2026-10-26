@@ -338,6 +338,9 @@ create alias pg_get_indexdef for "com.lealone.plugins.postgresql.sql.PgAlias.get
 drop alias if exists current_schema;
 create alias current_schema for "com.lealone.plugins.postgresql.sql.PgAlias.getCurrentSchema";
 
+drop alias if exists current_schemas;
+create alias current_schemas deterministic for "com.lealone.plugins.postgresql.sql.PgAlias.getCurrentSchemas";
+
 drop alias if exists pg_encoding_to_char;
 create alias pg_encoding_to_char for "com.lealone.plugins.postgresql.sql.PgAlias.getEncodingName";
 
