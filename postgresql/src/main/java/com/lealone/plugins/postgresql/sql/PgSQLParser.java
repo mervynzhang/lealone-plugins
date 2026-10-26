@@ -57,16 +57,35 @@ public class PgSQLParser extends SQLParserBase {
     private static final Pattern CURRENT_SCHEMAS_ANY = Pattern.compile(
             "(?i)(?<![A-Za-z0-9_$])ANY\\s*\\(\\s*(?:pg_catalog\\s*\\.\\s*)?current_schemas\\s*\\(\\s*(TRUE|FALSE)\\s*\\)\\s*\\)");
 
+    // pgjdbc 的 getPrimaryKeys/getIndexInfo/getImportedKeys 用
+    // information_schema._pg_expandarray(i.indkey) 把索引列"展开"成多行; Lealone 既没有
+    // 集合返回函数, 也不支持 (func()).n 这种复合类型字段访问。pg_catalog.pg_index_columns
+    // 一行一个索引列, 下面把这些展开表达式改写成对它的连接(别名 ic)。
+    private static final Pattern EXPAND_FIELD_N = Pattern.compile(
+            "(?i)\\(\\s*information_schema\\s*\\.\\s*_pg_expandarray\\s*\\(\\s*[A-Za-z_][A-Za-z0-9_$.]*\\s*\\)\\s*\\)\\s*\\.\\s*n\\b");
+    private static final Pattern EXPAND_FIELD_X = Pattern.compile(
+            "(?i)\\(\\s*information_schema\\s*\\.\\s*_pg_expandarray\\s*\\(\\s*[A-Za-z_][A-Za-z0-9_$.]*\\s*\\)\\s*\\)\\s*\\.\\s*x\\b");
+    private static final Pattern EXPAND_CALL = Pattern.compile(
+            "(?i)information_schema\\s*\\.\\s*_pg_expandarray\\s*\\(\\s*[A-Za-z_][A-Za-z0-9_$.]*\\s*\\)");
+    private static final Pattern RECORD_FIELD_X = Pattern
+            .compile("\\(\\s*([A-Za-z_][A-Za-z0-9_$.]*)\\s*\\)\\s*\\.\\s*x\\b");
+    private static final Pattern PG_INDEX_JOIN = Pattern
+            .compile("(?i)(JOIN\\s+pg_catalog\\.pg_index\\s+i\\s+ON\\s*\\([^)]*\\))");
+    private static final Pattern PG_INDEX_FROM = Pattern
+            .compile("(?i)(FROM\\s+pg_catalog\\.pg_index\\s+i\\s*)\\)");
     static String normalize(String sql) {
         if (sql == null)
             return sql;
         String upper = sql.toUpperCase();
         if (sql.indexOf('~') < 0 && sql.indexOf("::") < 0 && upper.indexOf("OPERATOR") < 0
                 && sql.indexOf("E'") < 0 && upper.indexOf("GENERATE_SERIES") < 0
-                && upper.indexOf("CURRENT_SCHEMAS") < 0)
+                && upper.indexOf("SYSTEM_RANGE") < 0 && upper.indexOf("CURRENT_SCHEMAS") < 0
+                && upper.indexOf("_PG_EXPANDARRAY") < 0 && upper.indexOf("PG_GET_INDEXDEF") < 0)
             return sql;
         String s = sql;
         s = rewriteOutsideLiterals(s, GENERATE_SERIES, matcher -> "SYSTEM_RANGE");
+        s = wrapRangeTableColumnAliases(s);
+        s = rewritePgExpandArray(s);
         s = rewriteOutsideLiterals(s, CURRENT_SCHEMAS_ANY, matcher -> {
             if (Boolean.parseBoolean(matcher.group(1))) {
                 return "ANY(SELECT 'pg_catalog' UNION SELECT 'public')";
@@ -169,6 +188,185 @@ public class PgSQLParser extends SQLParserBase {
             last = matcher.end();
         }
         sb.append(code, last, code.length());
+    }
+
+    /**
+     * 核心的 SYSTEM_RANGE 是函数表, 但解析器不支持 PostgreSQL 的列别名写法
+     * {@code SYSTEM_RANGE(1, 2) AS s(r)}(在 r 处直接报语法错)。pgjdbc 的 TypeInfoCache
+     * 正是这种写法, 而且 generate_series 已经被改写成 SYSTEM_RANGE。套一层派生表后
+     * 核心的 FunctionTable.setColumnAliases 就能生效:
+     * {@code (SELECT * FROM SYSTEM_RANGE(1, 2)) AS s(r)}。
+     * <p>
+     * 只处理后面确实跟着 {@code AS alias(col, ...)} 的 SYSTEM_RANGE, 不碰字符串字面量/注释。
+     */
+    private static String wrapRangeTableColumnAliases(String sql) {
+        if (sql.toUpperCase().indexOf("SYSTEM_RANGE") < 0) {
+            return sql;
+        }
+        int len = sql.length();
+        StringBuilder out = new StringBuilder(len + 32);
+        int i = 0;
+        while (i < len) {
+            int start = indexOfOutsideLiterals(sql, "SYSTEM_RANGE", i);
+            if (start < 0) {
+                out.append(sql, i, len);
+                break;
+            }
+            out.append(sql, i, start);
+            boolean wrapped = false;
+            int open = skipWhitespace(sql, start + "SYSTEM_RANGE".length());
+            if (open < len && sql.charAt(open) == '(') {
+                int close = findClosingParen(sql, open);
+                if (close > 0) {
+                    int p = skipWhitespace(sql, close + 1);
+                    if (regionMatchesIgnoreCase(sql, p, "AS")) {
+                        p = skipWhitespace(sql, p + 2);
+                    }
+                    int aliasEnd = readIdentifierEnd(sql, p);
+                    if (aliasEnd > 0) {
+                        int colOpen = skipWhitespace(sql, aliasEnd);
+                        if (colOpen < len && sql.charAt(colOpen) == '(') {
+                            int colClose = findClosingParen(sql, colOpen);
+                            if (colClose > 0) {
+                                out.append("(SELECT * FROM ").append(sql, start, close + 1)
+                                        .append(')');
+                                i = close + 1;
+                                wrapped = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if (!wrapped) {
+                out.append(sql, start, start + "SYSTEM_RANGE".length());
+                i = start + "SYSTEM_RANGE".length();
+            }
+        }
+        return out.toString();
+    }
+
+    /**
+     * Lealone 没有集合返回函数和复合类型字段访问, 把 pgjdbc 的
+     * information_schema._pg_expandarray(i.indkey) 展开改写成 pg_index_columns 连接:
+     * <ul>
+     * <li>在 JOIN pg_catalog.pg_index i 后面补
+     * JOIN pg_catalog.pg_index_columns ic ON (ic.indexrelid = i.indexrelid)</li>
+     * <li>(expandarray(i.indkey)).n 改成 ic.key_seq</li>
+     * <li>(expandarray(i.indkey)).x 和 expandarray(i.indkey) 改成 ic.attnum</li>
+     * <li>(result.KEYS).x 改成 result.KEYS</li>
+     * </ul>
+     */
+    private static String rewritePgExpandArray(String sql) {
+        if (sql.toUpperCase().indexOf("_PG_EXPANDARRAY") < 0) {
+            return sql;
+        }
+        String s = sql;
+        s = EXPAND_FIELD_N.matcher(s).replaceAll("ic.key_seq");
+        s = EXPAND_FIELD_X.matcher(s).replaceAll("ic.attnum");
+        s = EXPAND_CALL.matcher(s).replaceAll("ic.attnum");
+        s = RECORD_FIELD_X.matcher(s).replaceAll("$1");
+        s = PG_INDEX_JOIN.matcher(s).replaceAll(
+                "$1 JOIN pg_catalog.pg_index_columns ic ON (ic.indexrelid = i.indexrelid)");
+        s = PG_INDEX_FROM.matcher(s).replaceAll(
+                "$1 JOIN pg_catalog.pg_index_columns ic ON (ic.indexrelid = i.indexrelid))");
+        return s;
+    }
+
+    /** 忽略字符串字面量/引号标识符/注释, 找下一个完整单词(大小写不敏感) */
+    private static int indexOfOutsideLiterals(String sql, String word, int from) {
+        int len = sql.length();
+        int i = from;
+        while (i < len) {
+            char c = sql.charAt(i);
+            if (c == '\'' || c == '"') {
+                i = skipQuoted(sql, i, c);
+                continue;
+            }
+            if (c == '-' && i + 1 < len && sql.charAt(i + 1) == '-') {
+                int end = sql.indexOf('\n', i + 2);
+                i = end < 0 ? len : end + 1;
+                continue;
+            }
+            if (c == '/' && i + 1 < len && sql.charAt(i + 1) == '*') {
+                int end = sql.indexOf("*/", i + 2);
+                i = end < 0 ? len : end + 2;
+                continue;
+            }
+            if (sql.regionMatches(true, i, word, 0, word.length())
+                    && (i == 0 || !isIdentifierPart(sql.charAt(i - 1)))
+                    && (i + word.length() >= len || !isIdentifierPart(sql.charAt(i + word.length())))
+                    // 不处理 pg_catalog.SYSTEM_RANGE 这种带 schema 前缀的写法(极少见)
+                    && (i == 0 || sql.charAt(i - 1) != '.')) {
+                return i;
+            }
+            i++;
+        }
+        return -1;
+    }
+
+    private static boolean isIdentifierPart(char c) {
+        return Character.isLetterOrDigit(c) || c == '_' || c == '$';
+    }
+
+    private static int skipWhitespace(String sql, int i) {
+        while (i < sql.length() && Character.isWhitespace(sql.charAt(i))) {
+            i++;
+        }
+        return i;
+    }
+
+    /** 从 open 处的 '(' 找到配对的 ')', 跳过字符串/引号标识符/注释; 找不到返回 -1 */
+    private static int findClosingParen(String sql, int open) {
+        int depth = 0;
+        int i = open;
+        int len = sql.length();
+        while (i < len) {
+            char c = sql.charAt(i);
+            if (c == '\'' || c == '"') {
+                i = skipQuoted(sql, i, c);
+                continue;
+            }
+            if (c == '-' && i + 1 < len && sql.charAt(i + 1) == '-') {
+                int end = sql.indexOf('\n', i + 2);
+                i = end < 0 ? len : end + 1;
+                continue;
+            }
+            if (c == '/' && i + 1 < len && sql.charAt(i + 1) == '*') {
+                int end = sql.indexOf("*/", i + 2);
+                i = end < 0 ? len : end + 2;
+                continue;
+            }
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+                if (depth == 0) {
+                    return i;
+                }
+            }
+            i++;
+        }
+        return -1;
+    }
+
+    private static boolean regionMatchesIgnoreCase(String sql, int index, String word) {
+        return index >= 0 && index + word.length() <= sql.length()
+                && sql.regionMatches(true, index, word, 0, word.length())
+                && (index + word.length() >= sql.length()
+                        || !isIdentifierPart(sql.charAt(index + word.length())));
+    }
+
+    private static int readIdentifierEnd(String sql, int i) {
+        if (i >= sql.length())
+            return -1;
+        char c = sql.charAt(i);
+        if (!Character.isLetter(c) && c != '_')
+            return -1;
+        i++;
+        while (i < sql.length() && isIdentifierPart(sql.charAt(i))) {
+            i++;
+        }
+        return i;
     }
 
     @Override

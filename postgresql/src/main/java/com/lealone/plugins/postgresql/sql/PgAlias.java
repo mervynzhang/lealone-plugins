@@ -63,16 +63,32 @@ public class PgAlias {
      * 这里不能像 getCurrentSchema 那样查库: 别名函数拿到的是同一 session 的嵌套连接,
      * 遍历外层结果集时再查库会把外层游标冲掉(外层静默变成 0 行)。PgSQLParser 在会话建立时
      * 固定把 search_path 初始化为 public, pg_catalog, 所以直接按 PG 的语义返回即可。
+     * <p>
+     * 返回真正的字符串数组(text[]): pgjdbc 的 SQL 里会写
+     * {@code (current_schemas(false))[s.r]} 和 {@code array_upper(current_schemas(false), 1)},
+     * 返回逗号分隔的 varchar 时下标运算(ARRAY_GET)取不到元素, 只能恒为 null。
      *
      * @param conn the connection (unused, 保留给别名函数签名)
-     * @param includeImplicit 是否包含隐式 schema(pg_catalog); true 时再加上 public
-     * @return 逗号分隔的 schema 名
+     * @param includeImplicit 是否包含隐式 schema(pg_catalog); false 时只返回 search_path 里
+     *            显式列出的 public(与真 PG 的 current_schemas(false) = {public} 一致)
+     * @return schema 名数组
      */
-    public static String getCurrentSchemas(Connection conn, Boolean includeImplicit) {
+    public static String[] getCurrentSchemas(Connection conn, Boolean includeImplicit) {
         if (includeImplicit != null && includeImplicit.booleanValue()) {
-            return "pg_catalog, public";
+            return new String[] { "pg_catalog", "public" };
         }
-        return "pg_catalog";
+        return new String[] { "public" };
+    }
+
+    /**
+     * array_upper(anyarray, int): PG 数组的上界。当前只用于 current_schemas 返回的 text[],
+     * 一维数组的下标从 1 开始, 所以上界就是元素个数; 其他维度跟 PG 一样返回 null。
+     */
+    public static Integer arrayUpper(String[] array, int dimension) {
+        if (array == null || dimension != 1) {
+            return null;
+        }
+        return array.length;
     }
 
     /**

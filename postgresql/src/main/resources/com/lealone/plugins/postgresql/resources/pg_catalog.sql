@@ -178,7 +178,11 @@ left join (select table_schema, table_name, count(*) cnt from information_schema
 union all
 select
     x.id oid,
-    cast(lower(x.index_name) as varchar_ignorecase) relname,
+    -- PG 里主键索引的默认名字是 <table>_pkey(pgjdbc 的 getPrimaryKeys/getIndexInfo 会直接
+    -- 把 pg_class.relname 当 PK_NAME/INDEX_NAME 返回), 而 information_schema 里叫
+    -- PRIMARY_KEY_x, 这里按 PG 的习惯翻译一下
+    cast(case when x.primary_key then lower(x.table_name) || '_pkey'
+              else lower(x.index_name) end as varchar_ignorecase) relname,
     (select id from information_schema.schemas where schema_name = x.table_schema) relnamespace,
     'i' relkind,
     (select min(id) from information_schema.users where admin=true) relowner,
@@ -203,7 +207,8 @@ select
     0 reltoastrelid,
     0 relnatts,
     cast(null as array) reloptions
-from (select distinct id, index_name, table_schema, table_name from information_schema.indexes) x;
+from (select distinct id, index_name, table_schema, table_name, primary_key
+      from information_schema.indexes) x;
 grant select on pg_catalog.pg_class to public;
 
 create table pg_catalog.pg_proc(
@@ -344,6 +349,23 @@ where i.table_schema = t.table_schema
 and i.table_name = t.table_name;
 grant select on pg_catalog.pg_index to public;
 
+-- pg_index_columns: 一行一个索引列。pgjdbc 的 getPrimaryKeys/getIndexInfo 用
+-- information_schema._pg_expandarray(indkey) 把索引列"展开"成多行, Lealone 既没有集合
+-- 返回函数也不支持 (func()).n 这种复合类型字段访问; PgSQLParser.normalize 把那些表达式
+-- 改写成对这个视图的连接(别名 ic), 索引列信息直接来自 information_schema.indexes。
+create view pg_catalog.pg_index_columns
+as
+select
+    x.id indexrelid,
+    x.ordinal_position key_seq,
+    cast(lower(x.column_name) as varchar_ignorecase) column_name,
+    (select c.ordinal_position from information_schema.columns c
+      where c.table_schema = x.table_schema
+        and c.table_name = x.table_name
+        and c.column_name = x.column_name) attnum
+from information_schema.indexes x;
+grant select on pg_catalog.pg_index_columns to public;
+
 drop alias if exists pg_get_indexdef;
 create alias pg_get_indexdef for "com.lealone.plugins.postgresql.sql.PgAlias.getIndexColumn";
 
@@ -352,6 +374,11 @@ create alias current_schema for "com.lealone.plugins.postgresql.sql.PgAlias.getC
 
 drop alias if exists current_schemas;
 create alias current_schemas deterministic for "com.lealone.plugins.postgresql.sql.PgAlias.getCurrentSchemas";
+
+-- pgjdbc 的 TypeInfoCache 会写 array_upper(current_schemas(false), 1),
+-- Lealone 核心没有这个函数; current_schemas 现在返回 text[], 这里按 PG 语义返回一维上界
+drop alias if exists array_upper;
+create alias array_upper deterministic for "com.lealone.plugins.postgresql.sql.PgAlias.arrayUpper";
 
 drop alias if exists pg_encoding_to_char;
 create alias pg_encoding_to_char for "com.lealone.plugins.postgresql.sql.PgAlias.getEncodingName";

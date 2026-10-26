@@ -192,6 +192,47 @@ public class PgCatalogTest extends PgTestBase {
         }
     }
 
+    @Test
+    public void typeInfoReturnsRows() throws Exception {
+        // pgjdbc 的 getTypeInfo 会先跑 TypeInfoCache 的 catalog 查询,
+        // 原来缺 ARRAY_UPPER / 不支持 SYSTEM_RANGE(...) AS s(r) 的列别名, 直接报 90022。
+        java.util.Set<String> names = new java.util.HashSet<>();
+        int rows = 0;
+        try (ResultSet rs = conn.getMetaData().getTypeInfo()) {
+            while (rs.next()) {
+                rows++;
+                names.add(rs.getString("TYPE_NAME"));
+            }
+        }
+        if (rows < 10)
+            throw new AssertionError("getTypeInfo() 只返回 " + rows + " 行");
+        if (!names.contains("varchar"))
+            throw new AssertionError("getTypeInfo() 缺少 varchar: " + names);
+    }
+
+    @Test
+    public void primaryKeysReturnsRows() throws Exception {
+        // pgjdbc 的 getPrimaryKeys 用 information_schema._pg_expandarray(indkey) 展开主键列;
+        // Lealone 没有集合返回函数也没有复合类型字段访问, 靠 PgSQLParser.normalize 改写成
+        // pg_index_columns 连接, 这里守住"从报错变成返回行"。
+        try (Statement st = conn.createStatement()) {
+            st.executeUpdate("DROP TABLE IF EXISTS cat_pk");
+            st.executeUpdate("CREATE TABLE cat_pk(id int primary key, name varchar(10))");
+        }
+        try (ResultSet rs = conn.getMetaData().getPrimaryKeys(null, null, "cat_pk")) {
+            if (!rs.next())
+                throw new AssertionError("getPrimaryKeys 没有返回行");
+            if (!"id".equalsIgnoreCase(rs.getString("COLUMN_NAME")))
+                throw new AssertionError("主键列应该是 id, 实际 " + rs.getString("COLUMN_NAME"));
+            if (rs.getInt("KEY_SEQ") != 1)
+                throw new AssertionError("KEY_SEQ 应该是 1, 实际 " + rs.getInt("KEY_SEQ"));
+            if (!"cat_pk_pkey".equalsIgnoreCase(rs.getString("PK_NAME")))
+                throw new AssertionError("PK_NAME 应该是 cat_pk_pkey, 实际 " + rs.getString("PK_NAME"));
+            if (rs.next())
+                throw new AssertionError("单列主键不应该返回多行");
+        }
+    }
+
     // 已知限制: pgjdbc 的 getColumns 用了 ROW_NUMBER() OVER (PARTITION BY ...) 窗口函数,
     // Lealone 尚未支持窗口函数; 等窗口函数支持后去掉 @Ignore
     @org.junit.Ignore("Lealone 不支持窗口函数, pgjdbc getColumns 需要")

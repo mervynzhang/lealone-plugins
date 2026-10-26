@@ -28,6 +28,7 @@ import com.lealone.db.session.ServerSession;
 import com.lealone.db.table.Column;
 import com.lealone.db.table.Table;
 import com.lealone.db.value.Value;
+import com.lealone.db.value.ValueArray;
 import com.lealone.db.value.ValueBoolean;
 import com.lealone.db.value.ValueBytes;
 import com.lealone.db.value.ValueDate;
@@ -793,9 +794,58 @@ public class CommandPacketHandler extends PacketHandler {
             }
             return sb.toString();
         }
+        case PgType.PG_TYPE_TEXTARRAY:
+            return toPgArray(v);
         default:
             return v.getString();
         }
+    }
+
+    /**
+     * 数组的 PG 文本格式是 {a,b}(ValueArray.getString() 是 (a, b), 客户端解析不了)。
+     * 元素里有逗号/花括号/引号/反斜杠时按 PG 规则加双引号并转义。
+     */
+    private static String toPgArray(Value v) {
+        if (!(v instanceof ValueArray)) {
+            return v.getString();
+        }
+        Value[] list = ((ValueArray) v).getList();
+        StringBuilder sb = new StringBuilder(2 + list.length * 8);
+        sb.append('{');
+        for (int i = 0; i < list.length; i++) {
+            if (i > 0)
+                sb.append(',');
+            if (list[i] == null || list[i] == ValueNull.INSTANCE) {
+                sb.append("NULL");
+                continue;
+            }
+            String s = list[i].getString();
+            if (s == null) {
+                sb.append("NULL");
+                continue;
+            }
+            boolean quote = s.isEmpty();
+            for (int j = 0; !quote && j < s.length(); j++) {
+                char c = s.charAt(j);
+                if (c == ',' || c == '{' || c == '}' || c == '"' || c == '\\'
+                        || Character.isWhitespace(c)) {
+                    quote = true;
+                }
+            }
+            if (quote) {
+                sb.append('"');
+                for (int j = 0; j < s.length(); j++) {
+                    char c = s.charAt(j);
+                    if (c == '"' || c == '\\')
+                        sb.append('\\');
+                    sb.append(c);
+                }
+                sb.append('"');
+            } else {
+                sb.append(s);
+            }
+        }
+        return sb.append('}').toString();
     }
 
     private void sendParameterDescription(Prepared p) throws IOException {
