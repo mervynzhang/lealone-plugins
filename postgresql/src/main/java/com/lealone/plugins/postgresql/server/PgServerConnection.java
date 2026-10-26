@@ -9,6 +9,8 @@ import java.nio.ByteBuffer;
 import java.sql.SQLException;
 import java.util.Properties;
 
+import com.lealone.common.exceptions.DbException;
+
 import com.lealone.db.ConnectionInfo;
 import com.lealone.db.Constants;
 import com.lealone.db.plugin.PluginManager;
@@ -133,23 +135,91 @@ public class PgServerConnection extends AsyncServerConnection {
         return len - 4;
     }
 
+    // 一条消息处理完(含异步执行完)才处理下一条：Execute/Query 是异步的，执行期间收到的
+    // 后续包先复制排队，回调里调用 packetFinished() 再按顺序处理，保证协议顺序且不阻塞调度线程。
+    private boolean busy;
+    private final java.util.ArrayDeque<Object[]> pendingPackets = new java.util.ArrayDeque<>();
+
     @Override
     public void handle(NetBuffer buffer, boolean autoRecycle) {
         if (stop)
             return;
         try {
-            if (initDone) {
-                if (x < 0) {
-                    close();
-                    return;
-                }
-            } else {
-                x = 0;
+            if (!initDone) {
+                // 启动阶段(StartupMessage/SSLRequest)没有类型字节, 直接处理, 不会重入
+                packetHandler.handle(buffer, 0);
+                return;
             }
-            packetHandler.handle(buffer, x);
+            if (x < 0) {
+                close();
+                return;
+            }
+            int type = x;
+            byte[] data = copyPacket(buffer);
+            if (busy) {
+                pendingPackets.add(new Object[] { type, data });
+                return;
+            }
+            busy = true;
+            dispatchPacket(type, data);
         } finally {
             if (autoRecycle)
                 buffer.recycle();
         }
+    }
+
+    private void dispatchPacket(int type, byte[] data) {
+        boolean async;
+        try {
+            async = packetHandler.handle(toNetBuffer(data), type);
+        } catch (Throwable t) {
+            server.traceError(DbException.convert(t));
+            async = false;
+        }
+        if (!async)
+            packetFinished();
+    }
+
+    /** 当前包(及其异步执行)完成后调用：继续处理排队的下一个包 */
+    public void packetFinished() {
+        if (stop) {
+            busy = false;
+            pendingPackets.clear();
+            return;
+        }
+        Object[] next = pendingPackets.poll();
+        if (next == null) {
+            busy = false;
+            return;
+        }
+        dispatchPacket((Integer) next[0], (byte[]) next[1]);
+    }
+
+    private NetBuffer toNetBuffer(byte[] data) {
+        com.lealone.db.DataBuffer db = com.lealone.db.DataBuffer.create(data.length + 16);
+        NetBuffer nb = new NetBuffer(db);
+        nb.appendBytes(data, 0, data.length);
+        nb.position(0);
+        return nb;
+    }
+
+    /**
+     * 把当前包的有效载荷复制出来。注意 NetBuffer.length() 返回的是 dataBuffer.position()，
+     * 也就是"已经读到的位置"，不是包的结束位置；包尾要用底层 ByteBuffer 的 limit。
+     */
+    private static byte[] copyPacket(NetBuffer buffer) {
+        int start = buffer.position();
+        java.nio.ByteBuffer bb = buffer.getByteBuffer();
+        int end = bb.limit();
+        int len = end - start;
+        if (len <= 0)
+            return new byte[0];
+        byte[] data = new byte[len];
+        for (int i = 0; i < len; i++)
+            data[i] = bb.get(start + i);
+        // 必须把原 buffer 的读位置推到包尾, 否则网络层会认为这个包还没消费完,
+        // 把载荷当成下一个包的包头解析(Packet too large)
+        buffer.position(end);
+        return data;
     }
 }

@@ -45,19 +45,21 @@ public abstract class PacketHandler {
         in = new NetBufferInput();
     }
 
-    public abstract void handle(int x) throws IOException;
+    /** 处理一个消息；返回 true 表示已交给异步任务，完成后由连接继续处理下一个包。 */
+    public abstract boolean handle(int x) throws IOException;
 
-    public void handle(NetBuffer buffer, int x) {
+    public boolean handle(NetBuffer buffer, int x) {
         in.reset(buffer);
         try {
-            handle(x);
+            return handle(x);
         } catch (Exception e) {
             logger.error("handle packet exception", e);
             try {
                 sendErrorResponse(e);
             } catch (Exception e1) {
-                logger.error("sendErrorResponse exception", e);
+                logger.error("sendErrorResponse exception", e1);
             }
+            return false;
         }
     }
 

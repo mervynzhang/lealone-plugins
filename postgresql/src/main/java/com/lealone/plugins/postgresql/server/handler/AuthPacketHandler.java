@@ -22,7 +22,7 @@ public class AuthPacketHandler extends PacketHandler {
     }
 
     @Override
-    public void handle(int x) throws IOException {
+    public boolean handle(int x) throws IOException {
         switch (x) {
         case 0:
             server.trace("Init");
@@ -84,6 +84,7 @@ public class AuthPacketHandler extends PacketHandler {
                 server.trace("Unsupported: " + x + " (" + (char) x + ")");
             break;
         }
+        return false;
     }
 
     private void sendAuthenticationCleartextPassword() throws IOException {

@@ -1,14 +1,17 @@
 /*
  * Copyright Lealone Database Group.
  * Licensed under the Server Side Public License, v 1.
- * Initial Developer: zhh
+ * Initial Developer: zzh
  */
 package com.lealone.plugins.postgresql.server.handler;
 
 import java.io.IOException;
 import java.io.StringReader;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.nio.ByteBuffer;
-import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.util.ArrayList;
 import java.util.List;
 
 import com.lealone.common.exceptions.DbException;
@@ -17,14 +20,18 @@ import com.lealone.common.util.DataUtils;
 import com.lealone.common.util.ScriptReader;
 import com.lealone.common.util.StringUtils;
 import com.lealone.db.Database;
-import com.lealone.db.async.AsyncTask;
-import com.lealone.db.command.CommandParameter;
+import com.lealone.db.async.AsyncCallback;
+import com.lealone.db.async.AsyncResult;
 import com.lealone.db.result.Result;
 import com.lealone.db.schema.Schema;
+import com.lealone.db.session.ServerSession;
 import com.lealone.db.table.Column;
 import com.lealone.db.table.Table;
 import com.lealone.db.value.Value;
+import com.lealone.db.value.ValueBoolean;
 import com.lealone.db.value.ValueBytes;
+import com.lealone.db.value.ValueDate;
+import com.lealone.db.value.ValueDecimal;
 import com.lealone.db.value.ValueDouble;
 import com.lealone.db.value.ValueFloat;
 import com.lealone.db.value.ValueInt;
@@ -32,13 +39,22 @@ import com.lealone.db.value.ValueLong;
 import com.lealone.db.value.ValueNull;
 import com.lealone.db.value.ValueShort;
 import com.lealone.db.value.ValueString;
+import com.lealone.db.value.ValueTimestamp;
 import com.lealone.plugins.postgresql.server.PgServer;
 import com.lealone.plugins.postgresql.server.PgServerConnection;
 import com.lealone.plugins.postgresql.server.PgType;
 import com.lealone.sql.PreparedSQLStatement;
 import com.lealone.sql.SQLStatement;
+import com.lealone.db.command.CommandParameter;
 
-// 官方协议文档: https://www.postgresql.org/docs/15/protocol-message-formats.html
+/**
+ * PostgreSQL 前端/后端协议(v3)的命令消息处理器。
+ * <p>
+ * 关键点：**一条消息处理完必须立刻按顺序回包**。之前把 Bind/Execute 攒到 Sync 才处理，
+ * 导致：事务里第一条语句必崩(客户端已经收到后面语句的回包)、executeBatch 只有最后一条生效、
+ * Describe 不回 RowDescription、绑定 NULL 参数崩。现在每个 Execute 就地执行并同步等待结果，
+ * 处理完当前消息才读下一条消息，协议顺序自然成立。
+ */
 public class CommandPacketHandler extends PacketHandler {
 
     private final CaseInsensitiveMap<Prepared> prepared = new CaseInsensitiveMap<>();
@@ -49,50 +65,44 @@ public class CommandPacketHandler extends PacketHandler {
     }
 
     @Override
-    public void handle(int x) throws IOException {
+    public boolean handle(int x) throws IOException {
         switch (x) {
         case 'P':
             parse();
-            break;
+            return false;
         case 'B':
             bind();
-            break;
+            return false;
         case 'C':
             close();
-            break;
+            return false;
         case 'D':
             describe();
-            break;
+            return false;
         case 'E':
-            execute();
-            break;
+            return execute();
         case 'S':
-            // postgresql执行一条sql要分成5个包: Parse Bind Describe Execute Sync
-            // 执行到Execute这一步时会异步提交sql，此时不能继续处理Sync包，否则客户端会提前收到Sync的响应，但sql的结果还看不到
-            si.submitTask(new AsyncTask() {
-                @Override
-                public void run() {
-                    server.trace("Sync");
-                    try {
-                        sendReadyForQuery();
-                    } catch (IOException e) {
-                        server.trace("Sync IOException: " + e.getMessage());
-                    }
-                }
-            });
-            break;
+            server.trace("Sync");
+            sendReadyForQuery();
+            return false;
+        case 'H':
+            // Flush: 客户端要求把缓冲区里的响应发出去(不等 Sync)。我们每条消息都立即 flush，这里直接返回即可
+            server.trace("Flush");
+            out.flush();
+            return false;
         case 'Q':
-            query();
-            break;
+            return query();
         case 'X':
             server.trace("Terminate");
             conn.close();
-            break;
+            return false;
         default:
             server.trace("Unsupported: " + x + " (" + (char) x + ")");
-            break;
+            return false;
         }
     }
+
+    // ---------------------------------------------------------------- Parse / Bind
 
     private void parse() throws IOException {
         server.trace("Parse");
@@ -133,40 +143,60 @@ public class CommandPacketHandler extends PacketHandler {
 
     private void bind() throws IOException {
         server.trace("Bind");
-        Portal portal = new Portal();
-        portal.name = readString();
+        String portalName = readString();
         String prepName = readString();
         Prepared prep = prepared.get(prepName);
         if (prep == null) {
             sendErrorResponse("Prepared not found");
             return;
         }
-        portal.prep = prep;
-        portals.put(portal.name, portal);
         int formatCodeCount = readShort();
         int[] formatCodes = new int[formatCodeCount];
         for (int i = 0; i < formatCodeCount; i++) {
             formatCodes[i] = readShort();
         }
         int paramCount = readShort();
+        Value[] values = new Value[paramCount];
         for (int i = 0; i < paramCount; i++) {
             int paramLen = readInt();
-            byte[] d2 = DataUtils.newBytes(paramLen);
-            readFully(d2);
+            if (paramLen == -1) { // NULL 参数
+                values[i] = ValueNull.INSTANCE;
+                continue;
+            }
+            byte[] data = DataUtils.newBytes(paramLen);
+            readFully(data);
+            boolean text = isText(formatCodes, i);
             try {
-                setParameter(prep.prep, prep.paramTypes[i], i, d2, formatCodes, paramLen);
+                values[i] = decodeParameter(prep.paramTypes[i], data, text);
             } catch (Exception e) {
                 sendErrorResponse(e);
                 return;
             }
         }
         int resultCodeCount = readShort();
-        portal.resultColumnFormat = new int[resultCodeCount];
+        int[] resultColumnFormat = new int[resultCodeCount];
         for (int i = 0; i < resultCodeCount; i++) {
-            portal.resultColumnFormat[i] = readShort();
+            resultColumnFormat[i] = readShort();
         }
+        // 每个 Bind 生成一个新的 Portal 快照(参数值独立保存)，这样 batch 里的多条 Bind/Execute 互不影响
+        Portal portal = new Portal();
+        portal.name = portalName;
+        portal.prep = prep;
+        portal.values = values;
+        portal.resultColumnFormat = resultColumnFormat;
+        portals.put(portalName, portal);
         sendBindComplete();
     }
+
+    private static boolean isText(int[] formatCodes, int i) {
+        if (formatCodes.length == 0)
+            return true;
+        if (formatCodes.length == 1)
+            return formatCodes[0] == 0;
+        return i < formatCodes.length && formatCodes[i] == 0;
+    }
+
+    // ---------------------------------------------------------------- Describe / Execute
 
     private void describe() throws IOException {
         server.trace("Describe");
@@ -176,68 +206,238 @@ public class CommandPacketHandler extends PacketHandler {
             Prepared p = prepared.get(name);
             if (p == null) {
                 sendErrorResponse("Prepared not found: " + name);
-            } else {
-                sendParameterDescription(p);
+                return;
             }
+            sendParameterDescription(p);
+            sendRowDescriptionOrNoData(p.prep);
         } else if (type == 'P') {
             Portal p = portals.get(name);
             if (p == null) {
                 sendErrorResponse("Portal not found: " + name);
-            } else {
-                try {
-                    sendRowDescription(p.prep.prep.getMetaData().get(), p.resultColumnFormat);
-                } catch (Exception e) {
-                    sendErrorResponse(e);
-                }
+                return;
             }
+            sendRowDescriptionOrNoData(p.prep.prep);
         } else {
-            server.trace("expected S or P, got " + type);
-            sendErrorResponse("expected S or P");
+            sendErrorResponse("expected S or P, got " + type);
         }
     }
 
-    private void execute() throws IOException {
+    private boolean execute() throws IOException {
         server.trace("Execute");
         String name = readString();
+        int maxRows = readInt(); // 暂不支持游标/PortalSuspended，maxRows 忽略
         Portal p = portals.get(name);
         if (p == null) {
             sendErrorResponse("Portal not found: " + name);
-            return;
+            return false;
         }
-        int maxRows = readInt();
-        Prepared prepared = p.prep;
-        PreparedSQLStatement prep = prepared.prep;
-        server.trace(prepared.sql);
-        try {
-            submitYieldableCommand(prep, maxRows, false); // 不需要发送RowDescription
-        } catch (Exception e) {
-            sendErrorResponse(e);
+        Prepared prep = p.prep;
+        applyParameters(prep, p.values);
+        if (prep.prep.isQuery()) {
+            PreparedSQLStatement.Yieldable<?> yieldable = prep.prep.createYieldableQuery(maxRows,
+                    false, ar -> {
+                        try {
+                            if (ar.isFailed()) {
+                                sendErrorResponse(ar.getCause());
+                            } else {
+                                Result result = ar.getResult();
+                                try {
+                                    int rowCount = 0;
+                                    while (result.next()) {
+                                        sendDataRow(result);
+                                        rowCount++;
+                                    }
+                                    sendCommandComplete(prep.prep, rowCount);
+                                } finally {
+                                    result.close();
+                                }
+                            }
+                        } catch (Throwable e) {
+                            sendErrorQuietly(e);
+                        } finally {
+                            conn.packetFinished();
+                        }
+                    });
+            si.submitYieldableCommand(0, yieldable);
+        } else {
+            PreparedSQLStatement.Yieldable<?> yieldable = prep.prep.createYieldableUpdate(ar -> {
+                try {
+                    if (ar.isFailed())
+                        sendErrorResponse(ar.getCause());
+                    else
+                        sendCommandComplete(prep.prep, ar.getResult());
+                } catch (Throwable e) {
+                    sendErrorQuietly(e);
+                } finally {
+                    conn.packetFinished();
+                }
+            });
+            si.submitYieldableCommand(0, yieldable);
+        }
+        return true;
+    }
+
+    private void applyParameters(Prepared prep, Value[] values) {
+        List<? extends CommandParameter> parameters = prep.prep.getParameters();
+        int n = Math.min(parameters.size(), values.length);
+        for (int i = 0; i < n; i++) {
+            parameters.get(i).setValue(values[i]);
         }
     }
 
-    private void query() throws IOException {
+    /**
+     * 同步执行查询并等待结果。当前线程如果是调度线程，等待期间由调度器继续推进其他语句
+     * (SingleThreadAsyncCallback 的等待语义)，不会把调度线程卡死。
+     */
+    private Result executeQuery(PreparedSQLStatement stmt, int maxRows) {
+        AsyncCallback<Result> callback = AsyncCallback.createSingleThreadCallback();
+        PreparedSQLStatement.Yieldable<?> yieldable = stmt.createYieldableQuery(maxRows, false,
+                callback::setAsyncResult);
+        si.submitYieldableCommand(0, yieldable);
+        Result result = callback.get(EXECUTE_TIMEOUT_MILLIS);
+        if (result == null)
+            throw DbException.getInternalError("execute query timeout");
+        return result;
+    }
+
+    private int executeUpdate(PreparedSQLStatement stmt) {
+        AsyncCallback<Integer> callback = AsyncCallback.createSingleThreadCallback();
+        PreparedSQLStatement.Yieldable<?> yieldable = stmt.createYieldableUpdate(
+                callback::setAsyncResult);
+        si.submitYieldableCommand(0, yieldable);
+        Integer count = callback.get(EXECUTE_TIMEOUT_MILLIS);
+        return count == null ? 0 : count;
+    }
+
+    private static final long EXECUTE_TIMEOUT_MILLIS = 300_000;
+
+    // ---------------------------------------------------------------- Simple query
+
+    private static final class QueryQueue {
+        List<String> statements;
+        int index;
+    }
+
+    private QueryQueue queryQueue;
+
+    /** 当前结果集每列的 PG 类型，DataRow 输出时要按类型做文本编码(bool 用 t/f，bytea 用 \\x 十六进制) */
+    private int[] resultColumnTypes;
+
+    private boolean query() throws IOException {
         server.trace("Query");
         String query = readString();
+        QueryQueue q = new QueryQueue();
+        q.statements = new ArrayList<>();
         ScriptReader reader = new ScriptReader(new StringReader(query));
-        while (true) {
-            PreparedSQLStatement prep = null;
-            try {
-                String s = reader.readStatement();
-                if (s == null) {
+        try {
+            while (true) {
+                String stmt = reader.readStatement();
+                if (stmt == null)
                     break;
-                }
-                s = getSQL(s);
-                prep = session.prepareStatement(s);
-                submitYieldableCommand(prep, -1, true);
-            } catch (Exception e) {
-                sendErrorResponse(e);
-                sendReadyForQuery();
-                break;
+                stmt = getSQL(stmt);
+                if (!stmt.trim().isEmpty())
+                    q.statements.add(stmt);
             }
+        } catch (Exception e) {
+            sendErrorResponse(e);
+            sendReadyForQuery();
+            return false;
         }
-        // 异步执行sql，不能在此时发
-        // sendReadyForQuery();
+        queryQueue = q;
+        if (q.statements.isEmpty()) {
+            sendReadyForQuery();
+            queryQueue = null;
+            return false;
+        }
+        runNextQueryStatement();
+        return true;
     }
+
+    /** 依次异步执行 Query 里的多条语句；全部完成后发 ReadyForQuery 并继续处理下一个包 */
+    private void runNextQueryStatement() {
+        QueryQueue q = queryQueue;
+        if (q == null)
+            return;
+        if (q.index >= q.statements.size()) {
+            queryQueue = null;
+            try {
+                sendReadyForQuery();
+            } catch (IOException e) {
+                sendErrorQuietly(e);
+            } finally {
+                conn.packetFinished();
+            }
+            return;
+        }
+        String sql = q.statements.get(q.index++);
+        PreparedSQLStatement prep;
+        try {
+            prep = session.prepareStatement(sql);
+        } catch (Exception e) {
+            finishQueryWithError(e);
+            return;
+        }
+        if (prep.isQuery()) {
+            PreparedSQLStatement.Yieldable<?> yieldable = prep.createYieldableQuery(-1, false, ar -> {
+                try {
+                    if (ar.isFailed()) {
+                        finishQueryWithError(ar.getCause());
+                        return;
+                    }
+                    Result result = ar.getResult();
+                    try {
+                        sendRowDescription(prep.getMetaData().get());
+                        int rowCount = 0;
+                        while (result.next()) {
+                            sendDataRow(result);
+                            rowCount++;
+                        }
+                        sendCommandComplete(prep, rowCount);
+                    } finally {
+                        result.close();
+                    }
+                } catch (Throwable e) {
+                    finishQueryWithError(e);
+                    return;
+                }
+                runNextQueryStatement();
+            });
+            si.submitYieldableCommand(0, yieldable);
+        } else {
+            PreparedSQLStatement.Yieldable<?> yieldable = prep.createYieldableUpdate(ar -> {
+                try {
+                    if (ar.isFailed()) {
+                        finishQueryWithError(ar.getCause());
+                        return;
+                    }
+                    sendCommandComplete(prep, ar.getResult());
+                } catch (Throwable e) {
+                    finishQueryWithError(e);
+                    return;
+                }
+                runNextQueryStatement();
+            });
+            si.submitYieldableCommand(0, yieldable);
+        }
+    }
+
+    private void finishQueryWithError(Throwable e) {
+        queryQueue = null;
+        sendErrorQuietly(e);
+        try {
+            sendReadyForQuery();
+        } catch (IOException e1) {
+            sendErrorQuietly(e1);
+        } finally {
+            conn.packetFinished();
+        }
+    }
+
+    private void sendErrorQuietly(Throwable e) {
+        sendErrorResponse(e);
+    }
+
+    // ---------------------------------------------------------------- Close
 
     private void close() throws IOException {
         server.trace("Close");
@@ -245,70 +445,148 @@ public class CommandPacketHandler extends PacketHandler {
         String name = readString();
         if (type == 'S') {
             Prepared p = prepared.remove(name);
-            if (p != null) {
+            if (p != null && p.prep != null) {
                 p.prep.close();
             }
         } else if (type == 'P') {
             portals.remove(name);
         } else {
-            server.trace("expected S or P, got " + type);
-            sendErrorResponse("expected S or P");
+            sendErrorResponse("expected S or P, got " + type);
             return;
         }
         sendCloseComplete();
     }
 
-    // 异步执行SQL语句
-    private void submitYieldableCommand(PreparedSQLStatement stmt, int maxRows, boolean isQuery) {
-        PreparedSQLStatement.Yieldable<?> yieldable;
-        if (stmt.isQuery()) {
-            yieldable = stmt.createYieldableQuery(maxRows, false, ar -> {
-                if (ar.isSucceeded()) {
-                    try {
-                        Result result = ar.getResult();
-                        if (isQuery)
-                            sendRowDescription(stmt.getMetaData().get(), null);
-                        while (result.next()) {
-                            sendDataRow(result);
-                        }
-                        sendCommandComplete(stmt, 0);
-                        if (isQuery)
-                            sendReadyForQuery();
-                    } catch (Exception e) {
-                        sendErrorResponse(e);
-                    }
-                } else {
-                    sendErrorResponse(ar.getCause());
-                    if (isQuery) {
-                        try {
-                            sendReadyForQuery();
-                        } catch (IOException e) {
-                            sendErrorResponse(e);
-                        }
-                    }
-                }
-            });
-        } else {
-            yieldable = stmt.createYieldableUpdate(ar -> {
-                if (ar.isSucceeded()) {
-                    try {
-                        sendCommandComplete(stmt, ar.getResult());
-                    } catch (Exception e) {
-                        sendErrorResponse(e);
-                    }
-                } else {
-                    sendErrorResponse(ar.getCause());
-                }
-                if (isQuery) {
-                    try {
-                        sendReadyForQuery();
-                    } catch (IOException e) {
-                        sendErrorResponse(e);
-                    }
-                }
-            });
+    // ---------------------------------------------------------------- 参数解码
+
+    private Value decodeParameter(int pgType, byte[] data, boolean text) throws IOException {
+        if (text) {
+            String s = new String(data, getEncoding());
+            // PG 客户端会带时区后缀(比如 '2024-01-02 +00'、'2024-01-02 03:04:05+00')，Lealone 的类型解析器不认
+            switch (pgType) {
+            case PgType.PG_TYPE_DATE:
+                return ValueDate.parse(stripTimeZone(s));
+            case PgType.PG_TYPE_TIMESTAMP_NO_TMZONE:
+                return ValueTimestamp.parse(stripTimeZone(s));
+            case PgType.PG_TYPE_BOOL: {
+                String v = s.trim().toLowerCase();
+                return ValueBoolean.get("t".equals(v) || "true".equals(v) || "1".equals(v) || "y".equals(v));
+            }
+            case PgType.PG_TYPE_BYTEA:
+                return ValueBytes.getNoCopy(decodeByteaText(s));
+            case PgType.PG_TYPE_UNKNOWN: {
+                // pgjdbc 把 setDate/setTimestamp 的值当 UNKNOWN 类型发文本, 这里按形状识别
+                String t = stripTimeZone(s);
+                if (t.matches("\\d{4}-\\d{2}-\\d{2}"))
+                    return ValueDate.parse(t);
+                if (t.matches("\\d{4}-\\d{2}-\\d{2}[ T]\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?"))
+                    return ValueTimestamp.parse(t);
+                return ValueString.get(s);
+            }
+            default:
+                return ValueString.get(s);
+            }
         }
-        si.submitYieldableCommand(0, yieldable);
+        ByteBuffer buff = ByteBuffer.wrap(data);
+        switch (pgType) {
+        case PgType.PG_TYPE_BOOL:
+            checkParamLength(1, data.length);
+            return ValueBoolean.get(buff.get() != 0);
+        case PgType.PG_TYPE_INT2:
+            checkParamLength(2, data.length);
+            return ValueShort.get(buff.getShort());
+        case PgType.PG_TYPE_INT4:
+            checkParamLength(4, data.length);
+            return ValueInt.get(buff.getInt());
+        case PgType.PG_TYPE_INT8:
+            checkParamLength(8, data.length);
+            return ValueLong.get(buff.getLong());
+        case PgType.PG_TYPE_FLOAT4:
+            checkParamLength(4, data.length);
+            return ValueFloat.get(buff.getFloat());
+        case PgType.PG_TYPE_FLOAT8:
+            checkParamLength(8, data.length);
+            return ValueDouble.get(buff.getDouble());
+        case PgType.PG_TYPE_BYTEA:
+            return ValueBytes.getNoCopy(data);
+        case PgType.PG_TYPE_NUMERIC:
+            return decodeNumeric(data);
+        case PgType.PG_TYPE_DATE: {
+            checkParamLength(4, data.length);
+            long days = buff.getInt();
+            return ValueDate.get(new java.sql.Date((days * 86400L + 10957L * 86400L) * 1000L));
+        }
+        case PgType.PG_TYPE_TIMESTAMP_NO_TMZONE: {
+            checkParamLength(8, data.length);
+            long micros = buff.getLong();
+            long millis = 946684800000L + micros / 1000L; // 2000-01-01 00:00:00 UTC
+            return ValueTimestamp.get(new Timestamp(millis));
+        }
+        case PgType.PG_TYPE_VARCHAR:
+        case PgType.PG_TYPE_TEXT:
+        case PgType.PG_TYPE_BPCHAR:
+        case PgType.PG_TYPE_UNKNOWN:
+            return ValueString.get(new String(data, getEncoding()));
+        default:
+            throw DbException.getUnsupportedException(
+                    "binary parameter format for pg type " + pgType);
+        }
+    }
+
+    /** PostgreSQL NUMERIC 二进制格式: int16 ndigits, int16 weight, uint16 sign, int16 dscale, int16 digits[] */
+    private static Value decodeNumeric(byte[] data) {
+        ByteBuffer buff = ByteBuffer.wrap(data);
+        int ndigits = buff.getShort() & 0xFFFF;
+        int weight = buff.getShort();
+        int sign = buff.getShort() & 0xFFFF;
+        int dscale = buff.getShort() & 0xFFFF;
+        if (sign == 0xC000) // NaN
+            return ValueDecimal.get(BigDecimal.valueOf(Double.NaN));
+        // 按"未缩放整数 + 10^4 的权重"拼, 不能用 BigDecimal.pow 负指数(会抛 Invalid operation)
+        java.math.BigInteger unscaled = java.math.BigInteger.ZERO;
+        for (int i = 0; i < ndigits; i++) {
+            int digit = buff.getShort() & 0xFFFF;
+            unscaled = unscaled.multiply(java.math.BigInteger.valueOf(10000))
+                    .add(java.math.BigInteger.valueOf(digit));
+        }
+        BigDecimal value = new BigDecimal(unscaled).scaleByPowerOfTen(4 * (weight - ndigits + 1));
+        if (dscale > 0)
+            value = value.setScale(dscale, RoundingMode.HALF_UP);
+        if (sign == 0x4000)
+            value = value.negate();
+        return ValueDecimal.get(value);
+    }
+
+    /** 去掉 PG 文本形式里的时区后缀: 2024-01-02 +00 / 2024-01-02 03:04:05.123+08 / ... UTC */
+    static String stripTimeZone(String s) {
+        String v = s.trim();
+        int i = v.indexOf('+');
+        if (i < 0)
+            i = v.indexOf('-', 10); // 跳过日期里的 '-'
+        if (i > 0)
+            v = v.substring(0, i).trim();
+        if (v.endsWith("Z") || v.endsWith("UTC"))
+            v = v.substring(0, v.length() - ("UTC".length() < v.length() && v.endsWith("UTC") ? 3 : 1)).trim();
+        return v;
+    }
+
+    /** bytea 的文本形式: \x0102ff */
+    static byte[] decodeByteaText(String s) {
+        String v = s.trim();
+        if (v.startsWith("\\x")) {
+            String hex = v.substring(2);
+            byte[] b = new byte[hex.length() / 2];
+            for (int i = 0; i < b.length; i++) {
+                b[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+            }
+            return b;
+        }
+        return v.getBytes();
+    }
+
+    private static void checkParamLength(int expected, int got) {
+        if (expected != got)
+            throw DbException.getInvalidValueException("paramLen", got);
     }
 
     private String getSQL(String s) {
@@ -318,56 +596,58 @@ public class CommandPacketHandler extends PacketHandler {
         } else if (lower.startsWith("set client_encoding to")) {
             s = "set DATESTYLE ISO";
         }
-        // s = StringUtils.replaceAll(s, "i.indkey[ia.attnum-1]", "0");
         if (server.getTrace()) {
             server.trace(s + ";");
         }
         return s;
     }
 
+    // ---------------------------------------------------------------- 回包
+
     private void sendCommandComplete(PreparedSQLStatement stat, int updateCount) throws IOException {
         startMessage('C');
-        switch (stat.getType()) {
+        writeString(getCommandTag(stat.getType(), updateCount));
+        sendMessage();
+    }
+
+    private static String getCommandTag(int type, int count) {
+        switch (type) {
         case SQLStatement.INSERT:
-            writeStringPart("CommandInterfaceINSERT 0 ");
-            writeString(Integer.toString(updateCount));
-            break;
+            return "INSERT 0 " + count;
         case SQLStatement.UPDATE:
-            writeStringPart("UPDATE ");
-            writeString(Integer.toString(updateCount));
-            break;
+            return "UPDATE " + count;
         case SQLStatement.DELETE:
-            writeStringPart("DELETE ");
-            writeString(Integer.toString(updateCount));
-            break;
+            return "DELETE " + count;
         case SQLStatement.SELECT:
         case SQLStatement.CALL:
-            writeString("SELECT");
-            break;
+            return "SELECT " + count;
         case SQLStatement.BEGIN:
-            writeString("BEGIN");
-            break;
+            return "BEGIN";
+        case SQLStatement.COMMIT:
+            return "COMMIT";
+        case SQLStatement.ROLLBACK:
+            return "ROLLBACK";
+        case SQLStatement.SET:
+            return "SET";
+        case SQLStatement.CREATE_TABLE:
+            return "CREATE TABLE";
+        case SQLStatement.DROP_TABLE:
+            return "DROP TABLE";
         default:
-            server.trace("check CommandComplete tag for command " + stat);
-            writeStringPart("UPDATE ");
-            writeString(Integer.toString(updateCount));
+            return "OK";
         }
-        sendMessage();
     }
 
     private void sendDataRow(Result rs) throws Exception {
         int columns = rs.getVisibleColumnCount();
-        String[] values = new String[columns];
-        for (int i = 0; i < columns; i++) {
-            values[i] = rs.currentRow()[i].getString();
-        }
         startMessage('D');
         writeShort(columns);
-        for (String s : values) {
+        Value[] row = rs.currentRow();
+        for (int i = 0; i < columns; i++) {
+            String s = toText(row[i], i);
             if (s == null) {
                 writeInt(-1);
             } else {
-                // TODO write Binary data
                 byte[] d2 = s.getBytes(getEncoding());
                 writeInt(d2.length);
                 write(d2);
@@ -376,79 +656,51 @@ public class CommandPacketHandler extends PacketHandler {
         sendMessage();
     }
 
-    private static void checkParamLength(int expected, int got) {
-        if (expected != got) {
-            throw DbException.getInvalidValueException("paramLen", got);
-        }
-    }
-
-    private void setParameter(PreparedSQLStatement prep, int pgType, int i, byte[] d2, int[] formatCodes,
-            int paramLen) throws SQLException {
-        ByteBuffer buff = ByteBuffer.wrap(d2);
-        boolean text = (i >= formatCodes.length) || (formatCodes[i] == 0);
-        Value value;
-        try {
-            if (text) {
-                value = ValueString.get(new String(d2, getEncoding()));
-            } else {
-                // binary
-                switch (pgType) {
-                case PgType.PG_TYPE_INT2:
-                    checkParamLength(2, paramLen);
-                    value = ValueShort.get(buff.getShort());
-                    break;
-                case PgType.PG_TYPE_INT4:
-                    checkParamLength(4, paramLen);
-                    value = ValueInt.get(buff.getInt());
-                    break;
-                case PgType.PG_TYPE_INT8:
-                    checkParamLength(8, paramLen);
-                    value = ValueLong.get(buff.getLong());
-                    break;
-                case PgType.PG_TYPE_FLOAT4:
-                    checkParamLength(4, paramLen);
-                    value = ValueFloat.get(buff.getFloat());
-                    break;
-                case PgType.PG_TYPE_FLOAT8:
-                    checkParamLength(8, paramLen);
-                    value = ValueDouble.get(buff.getDouble());
-                    break;
-                case PgType.PG_TYPE_BYTEA: {
-                    value = ValueBytes.getNoCopy(d2);
-                    break;
-                }
-                case PgType.PG_TYPE_NUMERIC:
-                    value = ValueBytes.getNoCopy(d2);
-                    break;
-                default:
-                    server.trace("Binary format for type: " + pgType + " is unsupported");
-                    value = ValueBytes.getNoCopy(d2);
-                }
+    /** 按列类型做 PG 文本格式编码：boolean 必须是 t/f，bytea 必须是 \\x 十六进制 */
+    private String toText(Value v, int column) {
+        if (v == null || v == ValueNull.INSTANCE)
+            return null;
+        int type = resultColumnTypes != null && column < resultColumnTypes.length
+                ? resultColumnTypes[column]
+                : PgType.PG_TYPE_UNKNOWN;
+        switch (type) {
+        case PgType.PG_TYPE_BOOL:
+            return v.getBoolean() ? "t" : "f";
+        case PgType.PG_TYPE_BYTEA: {
+            byte[] b = v.getBytesNoCopy();
+            StringBuilder sb = new StringBuilder(2 + b.length * 2);
+            sb.append("\\x");
+            for (byte x : b) {
+                sb.append(Character.forDigit((x >> 4) & 0xF, 16)).append(Character.forDigit(x & 0xF, 16));
             }
-        } catch (Exception e) {
-            server.traceError(e);
-            value = ValueNull.INSTANCE;
+            return sb.toString();
         }
-        prep.getParameters().get(i).setValue(value);
+        default:
+            return v.getString();
+        }
     }
 
     private void sendParameterDescription(Prepared p) throws IOException {
+        List<? extends CommandParameter> parameters = p.prep.getParameters();
+        int count = parameters.size();
+        startMessage('t');
+        writeShort(count);
+        for (int i = 0; i < count; i++) {
+            int type = (p.paramTypes != null && p.paramTypes[i] != 0) ? p.paramTypes[i]
+                    : PgType.PG_TYPE_VARCHAR;
+            server.checkType(type);
+            writeInt(type);
+        }
+        sendMessage();
+    }
+
+    private void sendRowDescriptionOrNoData(PreparedSQLStatement stmt) throws IOException {
+        if (!stmt.isQuery()) {
+            sendNoData();
+            return;
+        }
         try {
-            List<? extends CommandParameter> parameters = p.prep.getParameters();
-            int count = parameters.size();
-            startMessage('t');
-            writeShort(count);
-            for (int i = 0; i < count; i++) {
-                int type;
-                if (p.paramTypes != null && p.paramTypes[i] != 0) {
-                    type = p.paramTypes[i];
-                } else {
-                    type = PgType.PG_TYPE_VARCHAR;
-                }
-                server.checkType(type);
-                writeInt(type);
-            }
-            sendMessage();
+            sendRowDescription(stmt.getMetaData().get());
         } catch (Exception e) {
             sendErrorResponse(e);
         }
@@ -459,85 +711,56 @@ public class CommandPacketHandler extends PacketHandler {
         sendMessage();
     }
 
-    private void sendRowDescription(Result result, int[] formatCodes) throws IOException {
+    /**
+     * 一律声明为 text 格式：原来会按客户端请求回 format=1(二进制)，但 DataRow 实际发的是文本，
+     * 结果 boolean 经 JDBC 读出来恒为 false、命名预备语句的 int 列让驱动抛 AIOOBE。
+     * 要么真写二进制编码，要么老实声明 text；这里选后者。
+     */
+    private void sendRowDescription(Result result) throws IOException {
         if (result == null) {
             sendNoData();
-        } else {
-            int columns = result.getVisibleColumnCount();
-            int[] oids = new int[columns];
-            int[] attnums = new int[columns];
-            int[] types = new int[columns];
-            int[] precision = new int[columns];
-            String[] names = new String[columns];
-            Database database = session.getDatabase();
-            for (int i = 0; i < columns; i++) {
-                String name = result.getColumnName(i);
-                Schema schema = database.findSchema(session, result.getSchemaName(i));
-                if (schema != null) {
-                    Table table = schema.findTableOrView(session, result.getTableName(i));
-                    if (table != null) {
-                        oids[i] = table.getId();
-                        Column column = table.getColumn(name);
-                        if (column != null) {
-                            attnums[i] = column.getColumnId() + 1;
-                        }
-                    }
-                }
-                names[i] = name;
-                int type = result.getColumnType(i);
-                int pgType = PgType.convertValueType(type);
-                // the ODBC client needs the column pg_catalog.pg_index
-                // to be of type 'int2vector'
-                // if (name.equalsIgnoreCase("indkey") &&
-                // "pg_index".equalsIgnoreCase(
-                // meta.getTableName(i + 1))) {
-                // type = PgServer.PG_TYPE_INT2VECTOR;
-                // }
-                precision[i] = result.getDisplaySize(i);
-                if (type != Value.NULL) {
-                    server.checkType(pgType);
-                }
-                types[i] = pgType;
-            }
-            startMessage('T');
-            writeShort(columns);
-            for (int i = 0; i < columns; i++) {
-                writeString(StringUtils.toLowerEnglish(names[i]));
-                // object ID
-                writeInt(oids[i]);
-                // attribute number of the column
-                writeShort(attnums[i]);
-                // data type
-                writeInt(types[i]);
-                // pg_type.typlen
-                writeShort(getTypeSize(types[i], precision[i]));
-                // pg_attribute.atttypmod
-                writeInt(-1);
-                // the format type: text = 0, binary = 1
-                writeShort(formatAsText(types[i], formatCodes, i) ? 0 : 1);
-            }
-            sendMessage();
+            return;
         }
-    }
-
-    /**
-     * Check whether the given type should be formatted as text.
-     *
-     * @param pgType data type
-     * @param formatCodes format codes, or {@code null}
-     * @param column 0-based column number
-     * @return true for text
-     */
-    private static boolean formatAsText(int pgType, int[] formatCodes, int column) {
-        boolean text = true;
-        if (formatCodes != null && formatCodes.length > 0) {
-            if (formatCodes.length == 1) {
-                text = formatCodes[0] == 0;
-            } else if (column < formatCodes.length) {
-                text = formatCodes[column] == 0;
+        int columns = result.getVisibleColumnCount();
+        int[] oids = new int[columns];
+        int[] attnums = new int[columns];
+        int[] types = new int[columns];
+        int[] precision = new int[columns];
+        String[] names = new String[columns];
+        Database database = session.getDatabase();
+        for (int i = 0; i < columns; i++) {
+            String name = result.getColumnName(i);
+            Schema schema = database.findSchema(session, result.getSchemaName(i));
+            if (schema != null) {
+                Table table = schema.findTableOrView(session, result.getTableName(i));
+                if (table != null) {
+                    oids[i] = table.getId();
+                    Column column = table.getColumn(name);
+                    if (column != null)
+                        attnums[i] = column.getColumnId() + 1;
+                }
             }
+            names[i] = name;
+            int type = result.getColumnType(i);
+            int pgType = PgType.convertValueType(type);
+            precision[i] = result.getDisplaySize(i);
+            if (type != Value.NULL)
+                server.checkType(pgType);
+            types[i] = pgType;
         }
-        return text;
+        resultColumnTypes = types;
+        startMessage('T');
+        writeShort(columns);
+        for (int i = 0; i < columns; i++) {
+            writeString(StringUtils.toLowerEnglish(names[i]));
+            writeInt(oids[i]);
+            writeShort(attnums[i]);
+            writeInt(types[i]);
+            writeShort(getTypeSize(types[i], precision[i]));
+            writeInt(-1);
+            writeShort(0); // text 格式
+        }
+        sendMessage();
     }
 
     private static int getTypeSize(int pgType, int precision) {
@@ -564,50 +787,17 @@ public class CommandPacketHandler extends PacketHandler {
         sendMessage();
     }
 
-    /**
-     * Represents a PostgreSQL Prepared object.
-     */
-    private static class Prepared {
-
-        /**
-         * The object name.
-         */
+    static class Prepared {
         String name;
-
-        /**
-         * The SQL statement.
-         */
         String sql;
-
-        /**
-         * The prepared statement.
-         */
         PreparedSQLStatement prep;
-
-        /**
-         * The list of parameter types (if set).
-         */
         int[] paramTypes;
     }
 
-    /**
-     * Represents a PostgreSQL Portal object.
-     */
-    private static class Portal {
-
-        /**
-         * The portal name.
-         */
+    static class Portal {
         String name;
-
-        /**
-         * The format used in the result set columns (if set).
-         */
-        int[] resultColumnFormat;
-
-        /**
-         * The prepared object.
-         */
         Prepared prep;
+        Value[] values;
+        int[] resultColumnFormat;
     }
 }
